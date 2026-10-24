@@ -1,0 +1,10 @@
+/dist/
+/node_modules/
+/vendor/
+/build/
+*.pteroext
+# aus src/client/lang/*.json erzeugt (npm run lang)
+/resources/lang/
+.env*
+*.log
+.phpunit.cache/

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+          cache-dependency-path: gateway/go.sum
+      - name: Install restic (integration tests skip without it)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends restic
+      - name: go vet
+        working-directory: gateway
+        run: go vet ./...
+      - name: gofmt
+        working-directory: gateway
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go test
+        working-directory: gateway
+        run: go test ./... -race -count=1
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # tools/extension.mk checks out the Panel sources (tag in PANEL_TAG) for the SDK and runs everything in Docker.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/peb-ext
+          key: panel-src-${{ hashFiles('tools/extension.mk') }}
+      - name: Set up toolchain and Panel checkout
+        working-directory: extension
+        run: make setup
+      - name: Install dependencies
+        working-directory: extension
+        run: make install
+      - name: Typecheck and tests
+        working-directory: extension
+        run: make check

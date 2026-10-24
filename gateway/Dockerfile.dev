@@ -1,0 +1,9 @@
+# Build and test environment (Go + restic from the same Debian release as the runtime image).
+FROM golang:1.26-trixie
+ARG UID=1000
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends restic ca-certificates git \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /go/pkg/mod /go/pkg/sumdb /cache/go-build \
+ && chown -R ${UID} /go/pkg /cache
+ENV GOCACHE=/cache/go-build HOME=/tmp GOFLAGS=-buildvcs=false

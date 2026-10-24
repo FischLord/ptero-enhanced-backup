@@ -1,0 +1,11 @@
+{
+    "description": "Dashboard, Server-Status und Dateibrowser fuer das PEB-Backup-Gateway.",
+    "autoload": {
+        "psr-4": {
+            "PebBackups\\": "src/"
+        }
+    },
+    "config": {
+        "autoloader-suffix": "PebBackupsExtension"
+    }
+}

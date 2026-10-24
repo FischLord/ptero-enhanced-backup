@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+vendor/
+*.pteroext
+bin/
+.env*
+*.log
+.phpunit.cache/
