@@ -20,7 +20,19 @@ jobs:
           cache-dependency-path: gateway/go.sum
       # The integration tests skip themselves when restic is missing, so install it to run them.
       - name: Install restic
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends restic
+        # Same restic as the gateway image (Debian package 0.18.0); Ubuntu's package is older and lacks features the gateway uses.
+        env:
+          RESTIC_VERSION: "0.18.0"
+        run: |
+          set -eu
+          base="https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}"
+          curl -fsSLO "${base}/restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          curl -fsSLO "${base}/SHA256SUMS"
+          grep " restic_${RESTIC_VERSION}_linux_amd64.bz2\$" SHA256SUMS | sha256sum -c -
+          bunzip2 "restic_${RESTIC_VERSION}_linux_amd64.bz2"
+          sudo install -m 0755 "restic_${RESTIC_VERSION}_linux_amd64" /usr/local/bin/restic
+          rm -f SHA256SUMS
+          restic version
       - name: go test
         working-directory: gateway
         run: go test ./... -race -count=1

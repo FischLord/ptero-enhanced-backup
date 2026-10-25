@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## Unreleased
 
+### CI
+
+- CI and the image workflow install restic 0.18.0 (the version in the gateway image, checksum-verified) instead of the older Ubuntu package, which failed the offsite and emergency-key integration tests.
+
 ## Gateway 0.2.0 and Extension Free 1.2.0 - 2026-10-25
 
 ### Gateway 0.2.0
