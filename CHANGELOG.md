@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### CI
 
+- The gateway dedup integration test no longer flakes: a modified second backup may add anywhere from 2.5 to 9.8 MB depending on the repository's random chunker polynomial, so it now only has to add less than the first, and a new identical re-backup carries the strict dedup check.
 - CI and the image workflow install restic 0.18.0 (the version in the gateway image, checksum-verified) instead of the older Ubuntu package, which failed the offsite and emergency-key integration tests.
 
 ## Gateway 0.2.0 and Extension Free 1.2.0 - 2026-10-25

@@ -373,8 +373,8 @@ func TestBackupRestoreDeleteAndDedup(t *testing.T) {
 		t.Run(variant.name, func(t *testing.T) {
 			e := newEnv(t)
 			ctx := context.Background()
-			srv, bk1, bk2 := "11111111-aaaa", "22222222-bbbb", "33333333-cccc"
-			key1, key2 := srv+"/"+bk1+".tar.gz", srv+"/"+bk2+".tar.gz"
+			srv, bk1, bk2, bk3 := "11111111-aaaa", "22222222-bbbb", "33333333-cccc", "44444444-dddd"
+			key1, key2, key3 := srv+"/"+bk1+".tar.gz", srv+"/"+bk2+".tar.gz", srv+"/"+bk3+".tar.gz"
 
 			data1 := baseTree()
 			arch1 := makeArchive(t, data1, variant.pgzip)
@@ -414,16 +414,24 @@ func TestBackupRestoreDeleteAndDedup(t *testing.T) {
 			b2 := e.backup(key2, makeArchive(t, data2, variant.pgzip))
 			t.Logf("%s: data_added first=%d second=%d (processed %d / %d)", variant.name, b1.DataAdded, b2.DataAdded,
 				b1.TotalBytesProcessed, b2.TotalBytesProcessed)
-			// Only the chunk(s) around the change are new; restic chunks are at most 8 MiB
-			// and the chunker polynomial is random per repository, so keep the bound loose.
-			if b2.DataAdded*2 > b1.DataAdded {
+			// How much a modified file adds depends on where the repository's random chunker
+			// polynomial puts the chunk boundaries (2.5-9.8 MB of 19 MB observed, restic chunks
+			// are up to 8 MiB), so a fixed fraction flakes. What is certain: the change touches
+			// at most two chunks (<= 16 MiB of 19 MB), so the second backup must add less than
+			// the first. The strict dedup check is the identical re-backup below.
+			if b2.DataAdded >= b1.DataAdded {
 				t.Fatalf("no dedup: first %d second %d", b1.DataAdded, b2.DataAdded)
+			}
+			// Identical content again: every chunk exists, almost nothing may be added.
+			b3 := e.backup(key3, makeArchive(t, data1, variant.pgzip))
+			if b3.DataAdded*20 > b1.DataAdded {
+				t.Fatalf("no dedup for identical content: first %d third %d", b1.DataAdded, b3.DataAdded)
 			}
 			_, body2 := e.download(key2)
 			equalTrees(t, data2, untar(t, bytes.NewReader(body2)))
 
 			// Delete via the panel; snapshot disappears, deleting again is fine.
-			for _, key := range []string{key1, key2} {
+			for _, key := range []string{key1, key2, key3} {
 				for range 2 {
 					out, err := e.panel.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 					if err != nil {
