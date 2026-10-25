@@ -53,7 +53,7 @@ The gateway implements the part of the S3 API that Pterodactyl uses (verified ag
 1. Parts are written to disk one by one (spool), gunzipped in order and passed as a tar stream to `restic backup --stdin`. With a small `BACKUP_MAX_PART_SIZE` (e.g. 256 MB) the spool stays small.
 2. While streaming, the tar archive's file list is indexed in SQLite. This later powers the file browser and single-file restore without restic having to read the whole snapshot.
 3. Snapshot tags: `server:<uuid>`, `backup:<uuid>`.
-4. Copying to secondary targets is planned via `restic copy`, asynchronously, so a slow target does not slow down the backup itself.
+4. Backups are copied to a secondary target with `restic copy`, asynchronously, so a slow target does not slow down the backup itself.
 
 **Restore/download flow:** `restic dump` streams the tar content; the gateway wraps it in gzip (fast level) and delivers it.
 
@@ -79,7 +79,7 @@ Technology (see https://docs.pterodactyl.io/v2/extensions):
 
 Implemented (see `extension/README.md`): dashboard (savings, health, 30-day history with forecast, server table with warnings), backups per server, file browser with single-file download (passed through the Panel), maintenance history with "Run now", and a "Backups" tab on a server's admin page. Settings: gateway URL, admin token, price, currency, warning threshold.
 
-Planned: target management UI, setup wizard, notifications.
+Planned: target management UI.
 
 **Retention is owned by the Panel.** The Free edition uses the Panel's rotation (`backup_limit`; only scheduled backups rotate). Deletion always goes through the Panel (`DeleteObject` to the gateway, then the Panel row is removed). The gateway never forgets snapshots by itself (`prune` cleans up afterwards in the maintenance window). Locked backups are never rotated away.
 

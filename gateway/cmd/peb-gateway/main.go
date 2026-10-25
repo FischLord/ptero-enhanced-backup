@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,7 +29,7 @@ import (
 )
 
 // version is set at build time (-ldflags "-X main.version=..."); the default is the current release.
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	if err := run(); err != nil {
@@ -83,12 +82,16 @@ func run() error {
 		MaxSpoolBytes: cfg.MaxSpoolBytes, MaxIngests: cfg.MaxConcurrentIngests,
 		MaxIndexFiles: cfg.MaxIndexFiles, NoIndexHash: !cfg.IndexHash, IngestTimeout: cfg.IngestTimeout,
 	})
-	var nt *notify.Notifier
-	if cfg.NtfyURL != "" {
-		nt = &notify.Notifier{URL: cfg.NtfyURL, Token: cfg.NtfyToken, Log: log}
+	nt := notify.New(cfg.Notify, log)
+	if len(nt.Channels) > 0 {
+		log.Info("notifications enabled", "channels", len(nt.Channels), "lang", nt.Language())
+	}
+	if cfg.Notify.SMTPHost != "" && cfg.Notify.SMTPUser != "" && strings.EqualFold(cfg.Notify.SMTPTLS, "none") {
+		log.Warn("PEB_SMTP_TLS=none sends the SMTP password unencrypted; use starttls or tls unless the mail server is local")
 	}
 	mgr.OnAbandoned = func(ev ingest.AbandonedEvent) {
-		nt.Send("PEB Backup abgebrochen", fmt.Sprintf("Backup %s von Server %s: %s.", ev.BackupUUID, ev.ServerUUID, ev.Reason))
+		nt.Send(notify.Event{Key: notify.EventBackupAbandoned, Params: notify.Params{
+			"backup": ev.BackupUUID, "server": ev.ServerUUID, "reason": ev.Reason}})
 	}
 	if err := mgr.Recover(ctx); err != nil {
 		return err
@@ -142,9 +145,7 @@ func run() error {
 				ForgetGrace: cfg.SecondaryForgetGrace, ForgetConfirm: cfg.SecondaryForgetConfirm,
 			},
 		}
-		if nt != nil {
-			off.Notify = nt
-		}
+		off.Notify = nt
 		maint.AfterWindow = off.Nightly
 		log.Info("offsite copy enabled", "type", restic.RepoType(cfg.SecondaryRepo), "delay", cfg.SecondaryDelay.String())
 	}
@@ -156,11 +157,8 @@ func run() error {
 			}
 			return
 		}
-		why := "Verarbeitung fehlgeschlagen"
-		if ev.TimedOut {
-			why = "Zeitüberschreitung"
-		}
-		nt.Send("PEB Backup fehlgeschlagen", fmt.Sprintf("Backup %s von Server %s fehlgeschlagen (%s). Details im Gateway-Log.", ev.BackupUUID, ev.ServerUUID, why))
+		nt.Send(notify.Event{Key: notify.EventBackupFailed, Params: notify.Params{
+			"backup": ev.BackupUUID, "server": ev.ServerUUID, "timed_out": ev.TimedOut}})
 	}
 	go maint.Run(ctx)
 	if off != nil {
@@ -183,7 +181,7 @@ func run() error {
 		Token: cfg.AdminToken, MetricsToken: cfg.MetricsToken, Store: st, Restic: rc, Keys: rc, Maint: maint, Dumps: api, Ingest: mgr,
 		SpoolUsed: mgr.Quota.Used, SpoolLimit: cfg.MaxSpoolBytes, Version: version, Repo: cfg.ResticRepo,
 		Capacity: cfg.RepoCapacityBytes, Log: log, Started: time.Now(), DownloadTimeout: cfg.DownloadTimeout,
-		Forgetter: rg, Notify: nt, OrphanRetention: cfg.OrphanRetention, ReconcileOff: !cfg.Reconcile,
+		Forgetter: rg, Notify: nt, NotifyAdmin: nt, OrphanRetention: cfg.OrphanRetention, ReconcileOff: !cfg.Reconcile,
 	}
 	if off != nil {
 		adm.Offsite = off

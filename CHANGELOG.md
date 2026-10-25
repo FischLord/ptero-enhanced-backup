@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## Unreleased
 
+## Gateway 0.3.0 and Extension Free 1.3.0 - 2026-10-25
+
+### Gateway 0.3.0
+
+#### Added
+- Notification channels: besides ntfy, failures can go to webhooks (`PEB_WEBHOOK_URLS`, formats `json`, `discord`, `slack`, `gotify` via `PEB_WEBHOOK_FORMAT`) and to e-mail (`PEB_SMTP_HOST`, `PEB_SMTP_PORT`, `PEB_SMTP_USER`, `PEB_SMTP_PASSWORD`, `PEB_SMTP_FROM`, `PEB_SMTP_TO`, `PEB_SMTP_TLS` = `starttls`, `tls` or `none`). Channels can be combined and run independently; a failing channel does not affect the others or any backup. `PEB_NTFY_URL` and `PEB_NTFY_TOKEN` keep working unchanged.
+- Admin API: `GET /admin/v1/notify` (language and channels, targets without secrets) and `POST /admin/v1/notify/test` (test message to every channel, per-channel result, one call per 10 seconds).
+- Egg variables for the new notification settings.
+
+#### Changed
+- **Notification texts are English by default now** (they were German before). The new `PEB_NOTIFY_LANG` (`en` or `de`) selects the language; if you want the previous German wording, set `PEB_NOTIFY_LANG=de` before updating.
+- Invalid notification settings now stop the gateway at startup with an error naming the variable, instead of being ignored: an unknown `PEB_NOTIFY_LANG`, `PEB_WEBHOOK_FORMAT` or `PEB_SMTP_TLS`, a webhook URL that is not http(s), an invalid `PEB_SMTP_PORT`, `PEB_SMTP_FROM` or `PEB_SMTP_TO` address, or only some of `PEB_SMTP_HOST`, `PEB_SMTP_FROM` and `PEB_SMTP_TO` set. Check the log after changing these variables.
+- The notification egg variables (webhook, SMTP and language) are not editable by the server owner, like the ntfy and token variables. Existing installations: update the egg (Setup assistant, **Update egg**, or re-import it) to see the new variables in the Panel; without it the gateway still works with its defaults.
+
+### Extension Free 1.3.0
+
+- Notifications card on the overview: lists the gateway's configured channels (ntfy, webhook, email; targets are redacted by the gateway) and the message language, explains the egg variables when none is set, and sends a test notification with a per-channel result (needs Gateway 0.3). The channel labels are readable in the dark theme.
+- Fix: a gateway answer `429 rate_limited` (test notification sent too often) is passed through to the Panel instead of becoming a generic 502.
+
 ### CI
 
 - The gateway dedup integration test no longer flakes: a modified second backup may add anywhere from 2.5 to 9.8 MB depending on the repository's random chunker polynomial, so it now only has to add less than the first, and a new identical re-backup carries the strict dedup check.

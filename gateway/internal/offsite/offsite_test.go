@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ptero-enhanced-backup/gateway/internal/gate"
+	"ptero-enhanced-backup/gateway/internal/notify"
 	"ptero-enhanced-backup/gateway/internal/restic"
 	"ptero-enhanced-backup/gateway/internal/store"
 )
@@ -154,7 +155,8 @@ type fakeNotify struct {
 	msgs []string
 }
 
-func (n *fakeNotify) Send(title, body string) {
+func (n *fakeNotify) Send(ev notify.Event) {
+	_, body := notify.Render("de", ev)
 	n.mu.Lock()
 	n.msgs = append(n.msgs, body)
 	n.mu.Unlock()

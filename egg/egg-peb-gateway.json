@@ -229,6 +229,106 @@
             "field_type": "text"
         },
         {
+            "name": "Notification Language",
+            "description": "Language of notification texts: en (English) or de (German).",
+            "env_variable": "PEB_NOTIFY_LANG",
+            "default_value": "en",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|in:en,de",
+            "field_type": "text"
+        },
+        {
+            "name": "Webhook URLs",
+            "description": "Optional. Comma-separated webhook URLs that receive notifications (Discord, Slack, Gotify or generic JSON). The URL usually contains a secret.",
+            "env_variable": "PEB_WEBHOOK_URLS",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "Webhook Format",
+            "description": "Payload format for all webhook URLs: json, discord, slack or gotify.",
+            "env_variable": "PEB_WEBHOOK_FORMAT",
+            "default_value": "json",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|in:json,discord,slack,gotify",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP Host",
+            "description": "Optional. SMTP server for e-mail notifications. Also set SMTP From and SMTP Recipients.",
+            "env_variable": "PEB_SMTP_HOST",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP Port",
+            "description": "SMTP port (587 for STARTTLS, 465 for TLS, 25 for none).",
+            "env_variable": "PEB_SMTP_PORT",
+            "default_value": "587",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|numeric|between:1,65535",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP User",
+            "description": "Optional. SMTP login name.",
+            "env_variable": "PEB_SMTP_USER",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP Password",
+            "description": "Optional. SMTP password.",
+            "env_variable": "PEB_SMTP_PASSWORD",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP From",
+            "description": "Sender address, for example peb@example.com or PEB <peb@example.com>.",
+            "env_variable": "PEB_SMTP_FROM",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP Recipients",
+            "description": "Comma-separated recipient addresses.",
+            "env_variable": "PEB_SMTP_TO",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "SMTP Encryption",
+            "description": "starttls (default), tls (implicit TLS) or none.",
+            "env_variable": "PEB_SMTP_TLS",
+            "default_value": "starttls",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|in:starttls,tls,none",
+            "field_type": "text"
+        },
+        {
             "name": "Maintenance Timeout",
             "description": "Deadline for each maintenance job (Go duration). restic is killed after it.",
             "env_variable": "PEB_MAINTENANCE_TIMEOUT",

@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 use PebBackups\Http\Controllers\BackupsController;
 use PebBackups\Http\Controllers\EditionController;
 use PebBackups\Http\Controllers\MaintenanceController;
+use PebBackups\Http\Controllers\NotifyController;
 use PebBackups\Http\Controllers\OverviewController;
 use PebBackups\Http\Controllers\SecurityController;
 use PebBackups\Http\Controllers\ServersController;
@@ -26,6 +27,9 @@ Route::get('/emergency-sheet', [SecurityController::class, 'emergencySheet'])->n
 Route::get('/keys', [SecurityController::class, 'keys'])->name('keys');
 Route::post('/keys', [SecurityController::class, 'createKey'])->name('keys.create');
 Route::delete('/keys/{key}', [SecurityController::class, 'deleteKey'])->where('key', '[0-9a-f]{8,64}')->name('keys.delete');
+// Benachrichtigungen: konfigurierte Kanaele (geschwaerzt) anzeigen und Testnachricht ausloesen (Gateway 0.3).
+Route::get('/notify', [NotifyController::class, 'index'])->name('notify');
+Route::post('/notify/test', [NotifyController::class, 'test'])->name('notify.test');
 Route::get('/edition', EditionController::class)->name('edition');
 
 // Einrichtungsassistent. POST-Routen legen Eggs/Server an bzw. senden Testanfragen; wie alle Routen hier nur fuer Root-Admins.

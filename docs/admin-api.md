@@ -64,7 +64,7 @@ Operational state of the gateway.
 }
 ```
 
-- `maintenance.prune_skipped_consecutive`: how many prune jobs in a row ended as `skipped: busy` (long backups, restores or an offsite copy held the repository), `0` after any prune that ran. `maintenance.warnings`: short English texts for things that need attention, empty if fine; currently `prune was skipped as busy N times in a row` once `N` reaches `PEB_PRUNE_SKIP_WARN` (default `2`, `0` = never warn). The same condition sends one ntfy message, and again only after a prune has run in between.
+- `maintenance.prune_skipped_consecutive`: how many prune jobs in a row ended as `skipped: busy` (long backups, restores or an offsite copy held the repository), `0` after any prune that ran. `maintenance.warnings`: short English texts for things that need attention, empty if fine; currently `prune was skipped as busy N times in a row` once `N` reaches `PEB_PRUNE_SKIP_WARN` (default `2`, `0` = never warn). The same condition sends one notification, and again only after a prune has run in between.
 - `secondary`: offsite copy, see below.
 - `repo.type`: `local`, `rest`, `sftp`, `s3`, `rclone`, `b2`, `azure`, `gs`, `swift`. `location` is shown without user and password.
 - `repo.reachable` is re-checked at most once per minute (`checked_at`).
@@ -336,7 +336,7 @@ Removes a trashed backup for good: `restic forget` right away (space is freed by
 
 ## POST /admin/v1/servers/{server_uuid}/deleted
 
-Tells the gateway that the Panel deleted the server. The gateway remembers the server as deleted (first mark wins, table `deleted_servers`) and moves all its complete backups into the trash with `reason: "server_deleted"` and `purge_after = deleted_at + PEB_ORPHAN_RETENTION` (default 30 days; `0` = at the next maintenance window). It sends one ntfy message. Idempotent.
+Tells the gateway that the Panel deleted the server. The gateway remembers the server as deleted (first mark wins, table `deleted_servers`) and moves all its complete backups into the trash with `reason: "server_deleted"` and `purge_after = deleted_at + PEB_ORPHAN_RETENTION` (default 30 days; `0` = at the next maintenance window). It sends one notification. Idempotent.
 
 ```json
 { "server_uuid": "5b1f8c0e-...", "newly_marked": true, "trashed": 12, "deleted_at": "2026-10-24T10:00:00Z", "purge_after": "2026-11-23T10:00:00Z" }
@@ -358,6 +358,30 @@ Compares the Panel's server list with the gateway's. Body: `{"server_uuids": [".
 - A server that is marked and still missing from the list gets backups that finished after the mark trashed again, with `purge_after` of now plus `PEB_ORPHAN_RETENTION` (never an expired date).
 - **One Panel per gateway.** The list must contain every server of the Panel this gateway serves. If two Panels share a gateway, each one's reconcile marks the other's servers as deleted (as soon as one UUID overlaps). Set `PEB_RECONCILE=0` in that case; the endpoint then answers `"skipped": "disabled"`.
 - Marking only moves backups into the trash; until `purge_after` everything can be undone by listing the server again.
+
+## GET /admin/v1/notify
+
+The configured notification channels, without secrets. `target` is scheme and host of a URL (`https://discord.com`), or `host:port → N recipients` for e-mail. `format` is present for webhooks (`json`, `discord`, `slack`, `gotify`). `channels` is an empty array if none is configured.
+
+```json
+{ "lang": "en",
+  "channels": [
+    { "type": "ntfy", "target": "https://ntfy.example.org" },
+    { "type": "webhook", "target": "https://discord.com", "format": "discord" },
+    { "type": "smtp", "target": "smtp.example.org:587 → 2 recipients" } ] }
+```
+
+## POST /admin/v1/notify/test
+
+Sends a test message (event `test`, severity `info`) to every channel at once and waits for the outcome, at most about 10 seconds per channel. The status is `200` even if some channels fail; `error` is a short text without URLs or secrets and only present when `ok` is `false`.
+
+```json
+{ "results": [
+    { "type": "webhook", "target": "https://discord.com", "ok": true },
+    { "type": "smtp", "target": "smtp.example.org:587 → 2 recipients", "ok": false, "error": "authentication failed" } ] }
+```
+
+A second call within 10 seconds answers `429` (`rate_limited`) with a `Retry-After` header.
 
 ## GET /admin/v1/history
 
@@ -522,4 +546,4 @@ Prometheus text format (version 0.0.4), outside the `/admin/v1` prefix on the sa
 - `/servers` and `/backups` contain only UUIDs. The extension fetches names and owners from the Panel.
 - The extension must reach the gateway via an address the Panel server can see. The token belongs in a `secret()` field of the extension settings.
 - The dashboard shows a warning until `PUT /settings/password-ack` has confirmed that the restic password is stored elsewhere. The emergency sheet is built in the browser from `/status`, `/summary` and `/servers`; it never contains the password.
-- Maintenance window, retention, targets and notifications are gateway egg variables and are not changed through the API for now.
+- Maintenance window, retention, targets and notification settings are gateway egg variables and are not changed through the API for now. `GET /notify` and `POST /notify/test` show and test the notification setup.

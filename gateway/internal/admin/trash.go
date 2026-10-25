@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
+	"ptero-enhanced-backup/gateway/internal/notify"
 	"ptero-enhanced-backup/gateway/internal/store"
 )
 
@@ -19,9 +19,9 @@ type Forgetter interface {
 	Forget(ctx context.Context, snapshotID string) error
 }
 
-// Notifier receives short messages (ntfy). The title is ASCII.
+// Notifier receives events for the configured notification channels.
 type Notifier interface {
-	Send(title, body string)
+	Send(ev notify.Event)
 }
 
 var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -179,9 +179,8 @@ func (s *Server) notifyServers(moved map[string]int, retention time.Duration) {
 		names = append(names[:3], "...")
 	}
 	days := int(retention.Hours() / 24)
-	s.Notify.Send("PEB Server geloescht", fmt.Sprintf(
-		"%d Server wurden im Panel geloescht (%s). Ihre %d Backups liegen im Papierkorb und werden nach %d Tagen endgueltig entfernt.",
-		servers, strings.Join(names, ", "), backups, days))
+	s.Notify.Send(notify.Event{Key: notify.EventServerDeleted, Params: notify.Params{
+		"servers": servers, "names": strings.Join(names, ", "), "backups": backups, "days": days}})
 }
 
 func (s *Server) serverDeleted(w http.ResponseWriter, r *http.Request) {

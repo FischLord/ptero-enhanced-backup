@@ -14,7 +14,7 @@ A small Go service that implements the part of the S3 API that Pterodactyl (the 
 - **Maintenance window** (daily, local time from `TZ`): `restic unlock` (stale locks only), `prune`, `check` (when due), then repository statistics. While `prune` and `check` run, no new ingests or restores start; running ones are waited for (at most 1 h, otherwise the job is skipped for today as `skipped: busy`). Uploads keep going into the spool, and `Complete` still answers immediately. All jobs are recorded in SQLite.
 - **Storage per server**: the statistics run also measures, per server, the space its snapshots occupy in the repository (`restic stats --mode raw-data --tag server:<uuid>`, compressed and deduplicated), one restic call per server, one after another (all servers nightly; after a series of backups only the affected servers, once, 2 minutes after the last backup). Shared data counts for each server, so the sum can exceed the repository size. Exposed as `stored_bytes` / `stored_at` in `/servers`.
 - **Admin API** under `/admin/v1` (bearer token, JSON): status, savings, history, servers, backups, file browser, single-file download, maintenance. Contract: `../docs/admin-api.md`
-- **ntfy notification** for failed or abandoned backups and maintenance jobs
+- **Notifications** for failed or abandoned backups and maintenance jobs: ntfy, webhooks (Discord, Slack, Gotify, generic JSON) and e-mail, in English or German
 
 ## Configuration (environment variables, egg variables)
 
@@ -51,20 +51,43 @@ A small Go service that implements the part of the S3 API that Pterodactyl (the 
 | `PEB_REPO_CAPACITY_BYTES` | optional capacity of the target for the "full in N days" forecast; only needed for non-local repositories, for local ones the measured space (`statfs`) wins | |
 | `PEB_NTFY_URL` | optional: full ntfy topic URL | |
 | `PEB_NTFY_TOKEN` | optional: ntfy token (bearer) | |
+| `PEB_NOTIFY_LANG` | language of notification texts: `en` or `de` | `en` |
+| `PEB_WEBHOOK_URLS` | optional: comma-separated webhook URLs (see [Notifications](#notifications)); a URL must not contain a comma itself | |
+| `PEB_WEBHOOK_FORMAT` | payload format of all webhooks: `json`, `discord`, `slack` or `gotify` | `json` |
+| `PEB_SMTP_HOST` | optional: SMTP server for e-mail notifications; needs `PEB_SMTP_FROM` and `PEB_SMTP_TO` | |
+| `PEB_SMTP_PORT` | SMTP port | `587` |
+| `PEB_SMTP_USER`, `PEB_SMTP_PASSWORD` | optional: SMTP login (AUTH PLAIN) | |
+| `PEB_SMTP_FROM` | sender address, e.g. `PEB <peb@example.com>` | |
+| `PEB_SMTP_TO` | comma-separated recipient addresses | |
+| `PEB_SMTP_TLS` | `starttls` (upgrade is required, there is no fallback to plain text), `tls` (implicit TLS, usually port 465) or `none` (no encryption; the password is sent in plain text, so only for a local mail server) | `starttls` |
 | `PEB_SECONDARY_REPO` | optional: second restic repository for the [offsite copy](#offsite-copy); empty = off. Must differ from `RESTIC_REPOSITORY`. | |
 | `PEB_SECONDARY_PASSWORD` | password of the offsite repository | same as the main repository |
 | `PEB_SECONDARY_DELAY` | quiet time after the last backup before the copy starts | `5m` |
 | `PEB_SECONDARY_TIMEOUT` | deadline for one copy run (the first copy can be large) | `6h` |
-| `PEB_PRUNE_SKIP_WARN` | warn (ntfy once, `maintenance.warnings` in the status) after this many prune jobs in a row were skipped as busy; `0` = never | `2` |
+| `PEB_PRUNE_SKIP_WARN` | warn (one notification, `maintenance.warnings` in the status) after this many prune jobs in a row were skipped as busy; `0` = never | `2` |
 | `PEB_TRASH_RETENTION` | how long a backup deleted in the Panel stays in the trash (Go duration like `168h`; `0` = forget at once) | `168h` |
 | `PEB_ORPHAN_RETENTION` | how long the backups of a server deleted in the Panel are kept (`0` = purged at the next maintenance window) | `720h` |
 | `PEB_RECONCILE` | accept the Panel's server list at `POST /admin/v1/servers/reconcile`; set `0` if several Panels share this gateway | `true` |
-| `PEB_TRASH_WARN_GB` | ntfy warning 24 h before the trash is emptied if at least this many GB of original data are affected; `0` = never | `10` |
+| `PEB_TRASH_WARN_GB` | notification 24 h before the trash is emptied if at least this many GB of original data are affected; `0` = never | `10` |
 | `PEB_SECONDARY_FORGET_GRACE` | how long a snapshot must be missing in the main repository before its offsite copy is forgotten; `0` = no grace | `48h` |
 | `PEB_SECONDARY_FORGET_CONFIRM` | releases a stopped forget step, see [offsite copy](#offsite-copy); set it to the offsite repository ID, then remove it again | |
 | `RCLONE_CONFIG` | path of the rclone config file for `rclone:` repositories (passed through to restic) | |
 
 All sizes are in bytes.
+
+### Notifications
+
+Messages are sent for: backup failed, backup aborted, maintenance job failed, prune skipped repeatedly, trash about to be emptied, server deleted in the Panel and offsite copy failed. Any combination of channels can be active at once, several webhook URLs and recipients are allowed. Each channel is delivered independently and in the background: a failing or slow channel never delays another channel or a backup (10 s limit per channel; failures are logged without the URL).
+
+- **ntfy**: `PEB_NTFY_URL` (and optionally `PEB_NTFY_TOKEN`). The title is sent as ASCII.
+- **Webhook**: `PEB_WEBHOOK_URLS` with `PEB_WEBHOOK_FORMAT`. `json` posts `{"event","title","message","severity","time"}` (`severity` is `info`, `warning` or `error`, `time` is RFC 3339 UTC). `discord` posts an embed, `slack` posts `{"text"}`, `gotify` posts `{"title","message","priority"}` (put the app token into the URL as `?token=`).
+- **E-mail**: the `PEB_SMTP_*` variables. Plain-text UTF-8 mail with `Date`, `Message-ID` and an encoded `Subject`.
+
+Credentials such as repository passwords are removed from every message, and URLs, tokens and passwords are never logged. `GET /admin/v1/notify` shows the configured channels (host only) and `POST /admin/v1/notify/test` sends a test message to all of them, see the [admin API](../docs/admin-api.md).
+
+Invalid notification settings stop the gateway at startup with an error naming the variable (unknown `PEB_NOTIFY_LANG`, `PEB_WEBHOOK_FORMAT` or `PEB_SMTP_TLS`, a webhook URL that is not http(s), an invalid `PEB_SMTP_PORT`, `PEB_SMTP_FROM` or `PEB_SMTP_TO` address, or only some of `PEB_SMTP_HOST`, `PEB_SMTP_FROM` and `PEB_SMTP_TO` set). Check the log after changing these variables.
+
+Upgrading: texts are English by default now. Set `PEB_NOTIFY_LANG=de` to keep the German messages.
 
 ### Full spool (backpressure)
 
@@ -89,7 +112,7 @@ Panel side: `APP_BACKUP_DRIVER=s3`, `AWS_ENDPOINT=<gateway URL>`, `AWS_USE_PATH_
 - In restic 0.18, `restic check` always locks the repository exclusively (verified), so the check also pauses ingests.
 - For local repositories (path without `rest:`, `sftp:` etc.) the real size of the directory is measured (on every statistics run, which also runs 2 minutes after the last backup of a series). With very many files on NFS this can take a while.
 - Only one maintenance run happens at a time. A second trigger (`POST /admin/v1/maintenance/run`) gets 409.
-- Error messages in the job history and in ntfy are deliberately generic ("prune failed, see gateway log"). Details are in the log.
+- Error messages in the job history and in notifications are deliberately generic ("prune failed, see gateway log"). Details are in the log.
 - After a series of backups the repository size and the affected servers' storage are refreshed once, 2 minutes after the last backup (at most 10 minutes after the first one); never during maintenance (the nightly run measures everything).
 - The admin API shares port and process with the S3 API (prefix `/admin/v1`). Therefore `PEB_BUCKET=admin` is rejected. Put it behind HTTPS (proxy) because the token travels in a header.
 - Single-file download streams `restic dump` of the tar and reads up to the requested entry. For a file at the end of a large backup this takes as long as a restore, and it occupies a restore slot (`PEB_MAX_CONCURRENT_DUMPS`).
@@ -107,7 +130,7 @@ curl -X POST -H "Authorization: Bearer $PEB_ADMIN_TOKEN" -d '{"jobs":["prune","s
 
 **Trash.** When the Panel deletes a backup (`DeleteObject`), the gateway does not forget the snapshot. The backup gets the status `trashed` with `trashed_at` and `purge_after = now + PEB_TRASH_RETENTION`. The Panel no longer sees it (`GET` on its key is `404`), but it is still in the repository. The nightly job `trash-purge` runs first in the maintenance window, forgets the expired backups and leaves the space to the `prune` that follows. A snapshot that fails to forget stays in the trash and is tried again the next night (the job is then marked failed and a notification is sent). Until then the admin can restore a backup or delete it for good through the admin API (`GET /trash`, `POST /trash/{uuid}/restore`, `DELETE /trash/{uuid}`) or the extension's Trash tab. A restored backup is a normal gateway backup again that the admin can browse and download; it cannot be hooked back into the Panel, because the Panel deleted its own record. Trashed backups still occupy repository space, so deleting in the Panel frees space only after the retention. Set `PEB_TRASH_RETENTION=0` to forget at once. The offsite copy mirrors a deletion only after the snapshot was forgotten in the main repository plus `PEB_SECONDARY_FORGET_GRACE`.
 
-**Deleted servers.** The Panel removes the backup rows of a deleted server by database cascade and never calls the S3 backend (Panel issue #2564), so the gateway would keep the snapshots forever. The extension therefore reports deleted servers: immediately through the Panel's server-operation event (`POST /admin/v1/servers/{uuid}/deleted`) and by comparing the Panel's server list with the gateway's hourly and when the dashboard is opened (`POST /admin/v1/servers/reconcile`). The gateway moves all backups of such a server to the trash with `purge_after = deleted_at + PEB_ORPHAN_RETENTION` (default 30 days) and sends an ntfy message. If the server UUID shows up again (a false alarm) the mark is lifted and the backups return. This comparison assumes one Panel per gateway (a second Panel's servers would be marked as deleted); turn it off with `PEB_RECONCILE=0` otherwise. Safety nets: an empty server list from the Panel, or a list that shares no UUID with the servers the gateway knows, marks nothing. Without the extension the gateway cannot learn about a deleted server; you can call the endpoint yourself, see [`../docs/admin-api.md`](../docs/admin-api.md).
+**Deleted servers.** The Panel removes the backup rows of a deleted server by database cascade and never calls the S3 backend (Panel issue #2564), so the gateway would keep the snapshots forever. The extension therefore reports deleted servers: immediately through the Panel's server-operation event (`POST /admin/v1/servers/{uuid}/deleted`) and by comparing the Panel's server list with the gateway's hourly and when the dashboard is opened (`POST /admin/v1/servers/reconcile`). The gateway moves all backups of such a server to the trash with `purge_after = deleted_at + PEB_ORPHAN_RETENTION` (default 30 days) and sends a notification. If the server UUID shows up again (a false alarm) the mark is lifted and the backups return. This comparison assumes one Panel per gateway (a second Panel's servers would be marked as deleted); turn it off with `PEB_RECONCILE=0` otherwise. Safety nets: an empty server list from the Panel, or a list that shares no UUID with the servers the gateway knows, marks nothing. Without the extension the gateway cannot learn about a deleted server; you can call the endpoint yourself, see [`../docs/admin-api.md`](../docs/admin-api.md).
 
 ## Metrics
 
@@ -148,7 +171,7 @@ With `PEB_SECONDARY_REPO` set, the gateway keeps a second restic repository in s
   - It does not forget if the main snapshot list cannot be read, or is empty while the secondary holds copies.
 
   A stopped step stays stopped, and `secondary.forget_blocked` is `true`, until you release it: set `PEB_SECONDARY_FORGET_CONFIRM` to the offsite repository ID (the message names it; it only works for exactly that repository) and restart, or call `POST /admin/v1/offsite/forget-confirm` (valid once). The release lifts the limits and the ID check for the next run; remove the variable afterwards, the gateway logs a reminder.
-- **Status:** `secondary` block in `GET /admin/v1/status` and `/summary`, jobs `copy`, `forget-secondary`, `prune-secondary`, `check-secondary` in `GET /admin/v1/maintenance`; `{"jobs":["copy"]}` starts a copy run. Failures go to ntfy (at most once per 12 hours while the error persists). Repository addresses are shown without credentials.
+- **Status:** `secondary` block in `GET /admin/v1/status` and `/summary`, jobs `copy`, `forget-secondary`, `prune-secondary`, `check-secondary` in `GET /admin/v1/maintenance`; `{"jobs":["copy"]}` starts a copy run. Failures are sent as notifications (at most once per 12 hours while the error persists). Repository addresses are shown without credentials.
 - **Temp space:** restic writes temporary pack files to `$TMPDIR`. Wings mounts `/tmp` in every container as a tmpfs of only 100 MB (its default `tmpfs_size`), which a copy overruns within seconds (`no space left on device`). The gateway therefore sets `TMPDIR=<PEB_DATA_DIR>/tmp` for all restic runs (created at startup, mode 0700; leftover `restic-temp-pack-*` files there are removed at startup). A `TMPDIR` you set yourself is kept. rclone, started by restic, inherits this environment. Make sure the data volume has some free space for it (a few packs, 16 MiB each by default).
 - Prune and check on the secondary read through the remote; on Google Drive expect slow runs and API quotas.
 
@@ -195,10 +218,11 @@ The `Dockerfile` builds a static binary and packages it with restic, rclone, tin
 
 ## Known limitations
 
-- If the gateway restarts during an upload, running uploads are lost (marked as failed, spool cleared). Wings has to restart the backup. The gateway sends one ntfy message per such backup at startup.
-- A Docker or Wings restart during a backup aborts it. Wings does not retry, so that backup is missing (no data is lost, and a half-finished snapshot is never stored). The gateway marks the upload as failed and sends an ntfy message once the upload is dropped: at the next start, or after 6 hours without activity. Do not update the Docker packages automatically (for example `apt-mark hold docker-ce docker-ce-cli containerd.io`), or run updates outside the backup schedules.
+- If the gateway restarts during an upload, running uploads are lost (marked as failed, spool cleared). Wings has to restart the backup. The gateway sends one notification per such backup at startup.
+- A Docker or Wings restart during a backup aborts it. Wings does not retry, so that backup is missing (no data is lost, and a half-finished snapshot is never stored). The gateway marks the upload as failed and sends a notification once the upload is dropped: at the next start, or after 6 hours without activity. Do not update the Docker packages automatically (for example `apt-mark hold docker-ce docker-ce-cli containerd.io`), or run updates outside the backup schedules.
 - If restic fails after `Complete`, the Panel has already stored the backup as successful. The gateway only marks it internally as `failed`, and a later `GET` returns 404. The dashboard has to show this.
 - `DeleteObject` on a backup that is still being processed waits up to 1 min, then 409. Applied to an upload that was never completed, it aborts it (204).
+- E-mail notifications authenticate with AUTH PLAIN only. Servers that offer only AUTH LOGIN (some Microsoft 365 setups) are not supported and report "authentication failed".
 - One main repository and at most one offsite copy. The offsite copy does not follow retention changes made outside the gateway if the main snapshot list is empty (safety stop), and a changed chunker setup requires a new, empty secondary repository.
 - **`restic forget` does not free space.** The space comes back with the next `prune` in the maintenance window (or immediately via the admin API).
 - If the gateway is down at the time of the window, the window is skipped and not made up for. Only `check` catches up, because it becomes due based on the interval since its last run.

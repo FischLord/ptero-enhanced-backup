@@ -9,6 +9,7 @@ import StorageTargetCard from '../components/StorageTargetCard';
 import OffsiteCard from '../components/OffsiteCard';
 import PasswordCard from '../components/PasswordCard';
 import EmergencyKeysCard from '../components/EmergencyKeysCard';
+import NotificationsCard from '../components/NotificationsCard';
 import HealthCard from '../components/HealthCard';
 import HistoryChart from '../components/HistoryChart';
 import ServersTable from '../components/ServersTable';
@@ -42,6 +43,7 @@ function Overview() {
                         <HistoryChart history={overview.history} />
                     </div>
                     <EmergencyKeysCard />
+                    <NotificationsCard />
                     <p className={'peb:text-xs peb:text-muted-foreground'}>{t('updated', { time: formatRelative(overview.generated_at, locale) })}</p>
                 </div>
             )}

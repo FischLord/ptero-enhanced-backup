@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"ptero-enhanced-backup/gateway/internal/notify"
 )
 
 type Config struct {
@@ -44,9 +46,8 @@ type Config struct {
 	PruneEnabled        bool
 	CheckInterval       time.Duration // 0 disables scheduled checks
 	CheckReadDataSubset string
-	RepoCapacityBytes   int64 // 0 = unknown
-	NtfyURL             string
-	NtfyToken           string
+	RepoCapacityBytes   int64         // 0 = unknown
+	Notify              notify.Config // channels and language, see package notify
 	MaintenanceTimeout  time.Duration // deadline per maintenance job
 	MaintenanceBusyWait time.Duration // how long maintenance waits for running ingests/restores
 	DownloadTimeout     time.Duration // deadline per restore/download
@@ -153,8 +154,16 @@ func Load(get func(string) string) (*Config, error) {
 	}
 	c.AdminToken = get("PEB_ADMIN_TOKEN")
 	c.MetricsToken = get("PEB_METRICS_TOKEN")
-	c.NtfyURL = get("PEB_NTFY_URL")
-	c.NtfyToken = get("PEB_NTFY_TOKEN")
+	c.Notify = notify.Config{
+		Lang: get("PEB_NOTIFY_LANG"), NtfyURL: get("PEB_NTFY_URL"), NtfyToken: get("PEB_NTFY_TOKEN"),
+		WebhookURLs: notify.SplitList(get("PEB_WEBHOOK_URLS")), WebhookFormat: get("PEB_WEBHOOK_FORMAT"),
+		SMTPHost: get("PEB_SMTP_HOST"), SMTPPort: int(num("PEB_SMTP_PORT", 0)), SMTPUser: get("PEB_SMTP_USER"),
+		SMTPPassword: get("PEB_SMTP_PASSWORD"), SMTPFrom: get("PEB_SMTP_FROM"),
+		SMTPTo: notify.SplitList(get("PEB_SMTP_TO")), SMTPTLS: get("PEB_SMTP_TLS"),
+	}
+	if err := c.Notify.Normalize(); err != nil {
+		errs = append(errs, err)
+	}
 	c.RepoCapacityBytes = num("PEB_REPO_CAPACITY_BYTES", 0)
 	m := timeRe.FindStringSubmatch(def("PEB_MAINTENANCE_TIME", "02:00"))
 	if m == nil {

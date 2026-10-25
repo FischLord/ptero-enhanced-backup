@@ -20,7 +20,7 @@ Pterodactyl and Wings are never modified. PEB only uses official interfaces: the
 - File browser per backup with single-file download, without restoring the whole server; SHA-256 per file and a diff API that compares two backups
 - Restic password safety: a reminder until you confirm the password is stored elsewhere, a printable emergency sheet (never contains the password) and a second emergency key
 - Prometheus `/metrics` endpoint and a Grafana dashboard
-- Notifications (ntfy) for failed or abandoned backups, maintenance, offsite copy and trash
+- Notifications for failed or abandoned backups, maintenance, offsite copy and trash: ntfy, webhooks (JSON, Discord, Slack, Gotify) and e-mail (SMTP)
 - Retention via the Panel's own backup rotation (`backup_limit`)
 
 ## Screenshots

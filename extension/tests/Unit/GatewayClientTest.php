@@ -176,3 +176,11 @@ test('redirects are not followed (a 3xx is an error, not a hop to another host)'
 
     expect($e->status)->toBe(502);
 });
+
+test('keeps a 429 as rate_limited instead of a generic 502', function () {
+    $http = new Factory;
+    $http->fake(['*' => Factory::response(['error' => 'rate_limited', 'message' => 'too soon'], 429)]);
+    $e = peb_error(fn () => peb_client($http)->post('notify/test', []));
+
+    expect($e->errorCode)->toBe('rate_limited')->and($e->status)->toBe(429);
+});

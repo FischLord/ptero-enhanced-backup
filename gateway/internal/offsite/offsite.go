@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"ptero-enhanced-backup/gateway/internal/notify"
 	"ptero-enhanced-backup/gateway/internal/restic"
 	"ptero-enhanced-backup/gateway/internal/secrets"
 	"ptero-enhanced-backup/gateway/internal/store"
@@ -75,9 +76,9 @@ type Gate interface {
 	Leave()
 }
 
-// Notifier receives failure messages (title is ASCII).
+// Notifier receives failure messages (rendered per channel and language).
 type Notifier interface {
-	Send(title, body string)
+	Send(ev notify.Event)
 }
 
 type Config struct {
@@ -311,7 +312,7 @@ func (s *Service) notifyError(msg string) {
 	}
 	s.lastNotify = s.now()
 	s.mu.Unlock()
-	s.Notify.Send("PEB Offsite-Kopie fehlgeschlagen", msg)
+	s.Notify.Send(notify.Event{Key: notify.EventOffsiteFailed, Params: notify.Params{"detail": msg}})
 }
 
 // ---- setup ----

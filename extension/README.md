@@ -17,7 +17,9 @@ Admin -> **Backups** (`/panel/backups`):
 
 The server list shows **backups / backup limit** of the Panel per server (running and successful backups, which is how the Panel counts as well).
 
-8. **Restic password safety:** until an admin confirms ("I have stored the password in a second place"), a warning banner sits at the top of the overview; afterwards only a quiet note remains. The state is stored in the gateway, not in the browser. The **emergency sheet** opens in a new window (nothing is saved on a server) and is meant to be printed: repository address (and the offsite repository), gateway address, restore commands without the gateway (`restic snapshots --tag server:<uuid>`, `dump`, `restore`, rclone note for Google Drive), the list of servers with UUIDs, and an empty box for writing the password by hand. The password itself is never shown. The **Emergency key** card creates a second restic key with its own random password, shown exactly once with a copy button and stored nowhere; it lists the keys and deletes other keys after confirmation (the key in use cannot be deleted). Needs Gateway 0.2.0.
+9. **Restic password safety:** until an admin confirms ("I have stored the password in a second place"), a warning banner sits at the top of the overview; afterwards only a quiet note remains. The state is stored in the gateway, not in the browser. The **emergency sheet** opens in a new window (nothing is saved on a server) and is meant to be printed: repository address (and the offsite repository), gateway address, restore commands without the gateway (`restic snapshots --tag server:<uuid>`, `dump`, `restore`, rclone note for Google Drive), the list of servers with UUIDs, and an empty box for writing the password by hand. The password itself is never shown. The **Emergency key** card creates a second restic key with its own random password, shown exactly once with a copy button and stored nowhere; it lists the keys and deletes other keys after confirmation (the key in use cannot be deleted). Needs Gateway 0.2.0.
+
+10. **Notifications:** card on the overview that shows the notification channels configured on the gateway (redacted) and the message language, and sends a test notification with a result per channel. Channels are set through egg variables on the gateway, not in the Panel. Needs Gateway 0.3.
 
 Admin -> **Setup** (`/panel/setup`): setup wizard, see below.
 
@@ -102,7 +104,7 @@ Single targets: `make typecheck`, `make test-js`, `make test-php`, `make build`,
 
 ```sh
 # on the Panel server
-runuser -u www-data -- php artisan p:extension:install /path/peb-backups-1.2.0.pteroext --enable
+runuser -u www-data -- php artisan p:extension:install /path/peb-backups-1.3.0.pteroext --enable
 chown -R www-data:www-data extensions public/assets/extensions
 ```
 

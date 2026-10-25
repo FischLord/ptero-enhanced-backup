@@ -192,6 +192,9 @@ class GatewayClient
         if (in_array($status, [400, 404, 409], true)) {
             return new GatewayException($code ?? 'gateway_error', $message ?? 'The gateway rejected the request.', $status);
         }
+        if ($status === 429) {
+            return new GatewayException($code ?? 'rate_limited', $message ?? 'The gateway is rate limiting this request. Wait a few seconds.', 429);
+        }
         if ($status === 503) {
             $retry = $response->header('Retry-After');
 

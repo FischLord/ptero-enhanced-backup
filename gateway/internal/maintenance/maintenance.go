@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ptero-enhanced-backup/gateway/internal/notify"
 	"ptero-enhanced-backup/gateway/internal/restic"
 	"ptero-enhanced-backup/gateway/internal/store"
 )
@@ -57,9 +58,9 @@ type Gate interface {
 	WaitIdle(ctx context.Context) error
 }
 
-// Notifier receives failure messages (title is ASCII).
+// Notifier receives failure messages (rendered per channel and language).
 type Notifier interface {
-	Send(title, body string)
+	Send(ev notify.Event)
 }
 
 type Config struct {
@@ -270,7 +271,7 @@ func (s *Service) execute(ctx context.Context, jobs []string, ids []int64) {
 			s.pruneSkipWarning(o)
 		}
 		if o.result == store.JobFailed && s.Notify != nil {
-			s.Notify.Send("PEB Wartung fehlgeschlagen", fmt.Sprintf("Wartungsjob %q ist fehlgeschlagen. Details im Gateway-Log.", typ))
+			s.Notify.Send(notify.Event{Key: notify.EventMaintenanceFailed, Params: notify.Params{"job": typ}})
 		}
 	}
 }
@@ -300,7 +301,7 @@ func (s *Service) pruneSkipWarning(o outcome) {
 		}
 		s.Log.Warn("prune keeps being skipped because the repository is busy", "times", n)
 		if s.Notify != nil {
-			s.Notify.Send("PEB Prune wird uebersprungen", fmt.Sprintf("Der Prune des Hauptrepos wurde %d Mal in Folge uebersprungen, weil das Repository belegt war (lange Backups, Restores oder Offsite-Kopie). Ohne Prune wird kein Speicher freigegeben.", n))
+			s.Notify.Send(notify.Event{Key: notify.EventPruneSkipped, Params: notify.Params{"count": n}})
 		}
 	}
 }
@@ -447,9 +448,8 @@ func (s *Service) warnTrashSoon(ctx context.Context) {
 	if len(items) == 0 || sum < s.Cfg.TrashWarnBytes {
 		return
 	}
-	s.Notify.Send("PEB Papierkorb wird geleert", fmt.Sprintf(
-		"Beim naechsten Wartungsfenster werden %d Backups (%.1f GB Originaldaten) endgueltig geloescht. Wiederherstellen geht bis dahin im Dashboard unter Papierkorb.",
-		len(items), float64(sum)/(1<<30)))
+	s.Notify.Send(notify.Event{Key: notify.EventTrashWarning, Params: notify.Params{
+		"count": len(items), "gb": float64(sum) / (1 << 30)}})
 }
 
 func (s *Service) failureOutcome(typ string, err error) outcome {

@@ -80,6 +80,8 @@ type Server struct {
 	// Forgetter purges trashed snapshots on request; Notify gets the trash messages (may be nil).
 	Forgetter Forgetter
 	Notify    Notifier
+	// NotifyAdmin backs GET /notify and POST /notify/test (nil: no channels, English).
+	NotifyAdmin NotifyAdmin
 	// OrphanRetention: how long the backups of a server deleted in the panel stay in the trash.
 	OrphanRetention time.Duration
 	// ReconcileOff answers POST /servers/reconcile with skipped=disabled (PEB_RECONCILE=0).
@@ -95,6 +97,9 @@ type Server struct {
 	reachMu sync.Mutex
 	reachAt time.Time
 	reachOK bool
+
+	testMu   sync.Mutex
+	testLast time.Time
 
 	metricsMu    sync.Mutex
 	metricsAt    time.Time
@@ -155,6 +160,8 @@ func (s *Server) routes() {
 	m.HandleFunc("POST "+Prefix+"/offsite/forget-confirm", s.offsiteForgetConfirm)
 	m.HandleFunc("GET "+Prefix+"/settings/password-ack", s.getPasswordAck)
 	m.HandleFunc("PUT "+Prefix+"/settings/password-ack", s.putPasswordAck)
+	m.HandleFunc("GET "+Prefix+"/notify", s.notifyInfo)
+	m.HandleFunc("POST "+Prefix+"/notify/test", s.notifyTest)
 	m.HandleFunc("GET "+Prefix+"/keys", s.listKeys)
 	m.HandleFunc("POST "+Prefix+"/keys", s.createKey)
 	m.HandleFunc("DELETE "+Prefix+"/keys/{id}", s.deleteKey)

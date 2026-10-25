@@ -13,6 +13,8 @@ import type {
     Edition,
     CreatedKey,
     EmergencySheetData,
+    NotifyConfig,
+    NotifyTestResult,
     PasswordAck,
     RepoKey,
     FilesResponse,
@@ -37,6 +39,7 @@ export const keys = {
     setupNodes: () => [EXTENSION_ID, 'setup', 'nodes'] as const,
     setupAllocations: (node: number) => [EXTENSION_ID, 'setup', 'allocations', node] as const,
     passwordAck: () => [EXTENSION_ID, 'password-ack'] as const,
+    notify: () => [EXTENSION_ID, 'notify'] as const,
     repoKeys: () => [EXTENSION_ID, 'keys'] as const,
     setupUsers: (q: string) => [EXTENSION_ID, 'setup', 'users', q] as const,
     trash: () => [EXTENSION_ID, 'trash'] as const,
@@ -122,6 +125,14 @@ export async function getPasswordAck(): Promise<PasswordAck> {
 
 export async function setPasswordAck(acknowledged: boolean): Promise<PasswordAck> {
     return (await http.put<PasswordAck>(`${BASE}/password-ack`, { acknowledged })).data;
+}
+
+export async function getNotifyConfig(): Promise<NotifyConfig> {
+    return (await http.get<NotifyConfig>(`${BASE}/notify`)).data;
+}
+
+export async function sendTestNotification(): Promise<{ results: NotifyTestResult[] }> {
+    return (await http.post<{ results: NotifyTestResult[] }>(`${BASE}/notify/test`)).data;
 }
 
 export async function getEmergencySheetData(): Promise<EmergencySheetData> {

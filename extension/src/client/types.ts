@@ -348,3 +348,22 @@ export interface TrashResponse {
     logical_bytes: number;
     items: TrashRow[];
 }
+
+/** Ein konfigurierter Benachrichtigungskanal; `target` ist vom Gateway bereits geschwaerzt (Gateway ab 0.3). */
+export interface NotifyChannel {
+    type: 'ntfy' | 'webhook' | 'smtp';
+    target: string;
+    format?: string;
+}
+
+export interface NotifyConfig {
+    lang: string;
+    channels: NotifyChannel[];
+}
+
+export interface NotifyTestResult {
+    type: NotifyChannel['type'];
+    target: string;
+    ok: boolean;
+    error?: string;
+}
