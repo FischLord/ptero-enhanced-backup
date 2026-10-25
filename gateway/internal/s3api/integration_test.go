@@ -31,6 +31,7 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/klauspost/pgzip"
 
+	"ptero-enhanced-backup/gateway/internal/gate"
 	"ptero-enhanced-backup/gateway/internal/ingest"
 	"ptero-enhanced-backup/gateway/internal/restic"
 	"ptero-enhanced-backup/gateway/internal/s3api"
@@ -56,7 +57,11 @@ type env struct {
 	st    *store.Store
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, nil, 0) }
+
+// newEnvWith lets tests wrap the ingest backend (e.g. to slow it down) and
+// shrink the spool (0 keeps the default).
+func newEnvWith(t *testing.T, wrap func(ingest.Backend) ingest.Backend, spoolMax int64) *env {
 	t.Helper()
 	bin := os.Getenv("PEB_RESTIC_BIN")
 	if bin == "" {
@@ -76,7 +81,16 @@ func newEnv(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	mgr := ingest.NewManager(st, rc, filepath.Join(dir, "spool"), log)
+	gt := &gate.Gate{}
+	var be ingest.Backend = &restic.Gated{Client: rc, Gate: gt}
+	if wrap != nil {
+		be = wrap(be)
+	}
+	mgr := ingest.NewManager(st, be, filepath.Join(dir, "spool"), log)
+	mgr.Gate = gt
+	if spoolMax > 0 {
+		mgr.Quota.Max = spoolMax
+	}
 	if err := mgr.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +303,12 @@ func (e *env) backup(key string, archive []byte) *store.Backup {
 
 func (e *env) waitStatus(key, want string) *store.Backup {
 	e.t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
+	return e.waitStatusFor(key, want, 2*time.Minute)
+}
+
+func (e *env) waitStatusFor(key, want string, limit time.Duration) *store.Backup {
+	e.t.Helper()
+	deadline := time.Now().Add(limit)
 	for time.Now().Before(deadline) {
 		b, err := e.st.BackupByKey(context.Background(), key)
 		if err == nil && b.Status == want {
@@ -647,17 +666,19 @@ func TestResourceLimits(t *testing.T) {
 		t.Fatalf("chunked part: %d %s", resp.StatusCode, body)
 	}
 
-	// Spool quota: 503 SlowDown so that Wings retries.
+	// A part that can never fit into the spool: 4xx (never 5xx, Wings would retry it
+	// with a half-read body) and the upload is failed.
 	e.mgr.Quota.Max = 10
 	resp, _ = wingsPut(url, make([]byte, 100))
-	if body := errBody(resp); resp.StatusCode != 503 || !strings.Contains(body, "SlowDown") {
-		t.Fatalf("spool full: %d %s", resp.StatusCode, body)
+	if body := errBody(resp); resp.StatusCode != 409 || !strings.Contains(body, "OperationAborted") {
+		t.Fatalf("spool too small: %d %s", resp.StatusCode, body)
 	}
 	e.mgr.Quota.Max = 1 << 30
 	resp, _ = wingsPut(url, make([]byte, 100))
-	if resp.StatusCode != 200 {
-		t.Fatalf("after quota freed: %d", resp.StatusCode)
+	if body := errBody(resp); resp.StatusCode != 409 {
+		t.Fatalf("failed upload must stay failed: %d %s", resp.StatusCode, body)
 	}
+	e.waitStatus(key, store.StatusFailed)
 }
 
 func TestBodyHashVerification(t *testing.T) {

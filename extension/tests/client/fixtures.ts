@@ -93,6 +93,8 @@ export const servers = (): ServersResponse => ({
             last_duration_ms: 13547,
             last_backup_bytes: 4849859072,
             last_data_added: 120586240,
+            stored_bytes: 2147483648,
+            stored_at: '2026-10-24T14:10:00Z',
             health: 'ok',
         },
         {
@@ -109,6 +111,8 @@ export const servers = (): ServersResponse => ({
             last_duration_ms: 21600000,
             last_backup_bytes: 0,
             last_data_added: 0,
+            stored_bytes: null,
+            stored_at: null,
             health: 'failed',
         },
     ],

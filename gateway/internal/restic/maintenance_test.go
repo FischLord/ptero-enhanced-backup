@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,5 +68,53 @@ func TestFSSpace(t *testing.T) {
 	}
 	if _, _, err := FSSpace(filepath.Join(t.TempDir(), "missing")); err == nil {
 		t.Fatal("missing path must fail")
+	}
+}
+
+func TestCleanEnvDropsRepositoryAndPasswordVariables(t *testing.T) {
+	in := []string{"PATH=/bin", "RESTIC_PASSWORD=a", "RESTIC_PASSWORD_FILE=/x", "RESTIC_REPOSITORY=/r", "RESTIC_FROM_PASSWORD=b",
+		"RCLONE_CONFIG=/home/container/rclone.conf", "RESTIC_COMPRESSION=max"}
+	out := cleanEnv(in)
+	if len(out) != 3 || out[0] != "PATH=/bin" || out[1] != "RCLONE_CONFIG=/home/container/rclone.conf" || out[2] != "RESTIC_COMPRESSION=max" {
+		t.Fatalf("%v", out)
+	}
+}
+
+func TestCommandSetsTmpDir(t *testing.T) {
+	tmpdirOf := func(c *Client) string {
+		got := ""
+		for _, kv := range c.command(context.Background(), "version").Env {
+			if v, ok := strings.CutPrefix(kv, "TMPDIR="); ok {
+				got = v
+			}
+		}
+		return got
+	}
+	t.Setenv("TMPDIR", "")
+	if got := tmpdirOf(&Client{TmpDir: "/data/tmp"}); got != "/data/tmp" {
+		t.Fatalf("TMPDIR=%q", got)
+	}
+	t.Setenv("TMPDIR", "/operator")
+	if got := tmpdirOf(&Client{TmpDir: "/data/tmp"}); got != "/operator" {
+		t.Fatalf("operator TMPDIR not respected: %q", got)
+	}
+}
+
+func TestCleanTmpOnlyRemovesResticTempPacks(t *testing.T) {
+	d := t.TempDir()
+	for _, n := range []string{"restic-temp-pack-1", "restic-temp-pack-2", "other.txt", "restic-cache"} {
+		if err := os.WriteFile(filepath.Join(d, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(d, "restic-temp-pack-dir"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if n := CleanTmp(d); n != 2 {
+		t.Fatalf("removed %d", n)
+	}
+	left, _ := os.ReadDir(d)
+	if len(left) != 3 {
+		t.Fatalf("left: %v", left)
 	}
 }

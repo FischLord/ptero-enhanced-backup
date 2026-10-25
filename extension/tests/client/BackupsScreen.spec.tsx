@@ -14,6 +14,8 @@ vi.mock('../../src/client/api', async (importOriginal) => ({
     getMaintenance: vi.fn(),
     runMaintenance: vi.fn(),
     probeDownload: vi.fn(),
+    getPasswordAck: vi.fn(),
+    getRepoKeys: vi.fn(),
 }));
 
 const mocked = vi.mocked(api);
@@ -25,6 +27,8 @@ beforeEach(() => {
     mocked.getServers.mockResolvedValue(servers());
     mocked.getBackups.mockResolvedValue({ items: [backup()], total: 1, limit: 25, offset: 0 });
     mocked.getFiles.mockResolvedValue(files());
+    mocked.getPasswordAck.mockResolvedValue({ acknowledged: true, acknowledged_at: '2026-10-20T10:00:00Z', by: 'root' });
+    mocked.getRepoKeys.mockResolvedValue({ keys: [] });
     mocked.getMaintenance.mockResolvedValue({ items: [job(), job({ id: 2, type: 'check', result: 'skipped', message: 'skipped: busy', bytes_freed: null })] });
 });
 

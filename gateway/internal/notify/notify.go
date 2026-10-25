@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"ptero-enhanced-backup/gateway/internal/secrets"
 )
 
 // Notifier posts to one ntfy topic URL. A nil Notifier does nothing.
@@ -27,6 +29,7 @@ func (n *Notifier) Send(title, body string) {
 	if n == nil || n.URL == "" {
 		return
 	}
+	title, body = secrets.Scrub(title), secrets.Scrub(body)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()

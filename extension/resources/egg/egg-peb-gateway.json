@@ -1,0 +1,362 @@
+{
+    "_comment": "PEB Gateway egg (ptero-enhanced-backup). Image is built locally: docker build -t peb-gateway:dev gateway/",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-10-24T12:00:00+00:00",
+    "name": "PEB Gateway",
+    "author": "46058672+FischLord@users.noreply.github.com",
+    "description": "S3-compatible gateway that stores Pterodactyl backups deduplicated in a restic repository.",
+    "features": null,
+    "docker_images": {
+        "PEB Gateway": "ghcr.io/fischlord/peb-gateway:latest"
+    },
+    "file_denylist": [],
+    "startup": "/usr/local/bin/peb-gateway",
+    "config": {
+        "files": "{}",
+        "startup": "{\n    \"done\": \"\\\"msg\\\":\\\"listening\\\"\"\n}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\nmkdir -p /mnt/server/data\necho \"done\"\n",
+            "container": "debian:bookworm-slim",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "S3 Access Key",
+            "description": "S3 access key the panel and Wings use (AWS_ACCESS_KEY_ID).",
+            "env_variable": "PEB_ACCESS_KEY",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "S3 Secret Key",
+            "description": "S3 secret key (AWS_SECRET_ACCESS_KEY).",
+            "env_variable": "PEB_SECRET_KEY",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Bucket",
+            "description": "Bucket name, must match AWS_BACKUPS_BUCKET in the panel.",
+            "env_variable": "PEB_BUCKET",
+            "default_value": "pterodactyl",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:63",
+            "field_type": "text"
+        },
+        {
+            "name": "Region",
+            "description": "Must match AWS_DEFAULT_REGION in the panel.",
+            "env_variable": "PEB_REGION",
+            "default_value": "us-east-1",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Restic Password",
+            "description": "Key to all backups. Losing it loses all data.",
+            "env_variable": "RESTIC_PASSWORD",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "required|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Restic Repository",
+            "description": "Optional. Restic repository path or URL. Empty = <data>/repo. Example: /mnt/peb/repo (Pterodactyl mount).",
+            "env_variable": "RESTIC_REPOSITORY",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Listen Address",
+            "description": "Optional. Empty = 0.0.0.0:SERVER_PORT (allocation port).",
+            "env_variable": "PEB_LISTEN",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Max Part Bytes",
+            "description": "Largest accepted part size in bytes.",
+            "env_variable": "PEB_MAX_PART_BYTES",
+            "default_value": "1073741824",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|numeric",
+            "field_type": "text"
+        },
+        {
+            "name": "Max Spool Bytes",
+            "description": "Spool quota in bytes.",
+            "env_variable": "PEB_MAX_SPOOL_BYTES",
+            "default_value": "8589934592",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|numeric",
+            "field_type": "text"
+        },
+        {
+            "name": "Log Level",
+            "description": "debug, info, warn or error.",
+            "env_variable": "PEB_LOG_LEVEL",
+            "default_value": "info",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:debug,info,warn,error",
+            "field_type": "text"
+        },
+        {
+            "name": "Admin Token",
+            "description": "Bearer token for the admin API (/admin/v1), at least 32 characters. Empty = admin API disabled.",
+            "env_variable": "PEB_ADMIN_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|min:32|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Metrics Token",
+            "description": "Optional own bearer token for GET /metrics (Prometheus), at least 32 characters. Empty = the admin token is used; without either token /metrics is off.",
+            "env_variable": "PEB_METRICS_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|min:32|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Timezone",
+            "description": "Local time zone for the maintenance window.",
+            "env_variable": "TZ",
+            "default_value": "Europe/Berlin",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Maintenance Time",
+            "description": "Daily maintenance window (HH:MM, local time): unlock, prune, check, stats.",
+            "env_variable": "PEB_MAINTENANCE_TIME",
+            "default_value": "02:00",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:5",
+            "field_type": "text"
+        },
+        {
+            "name": "Prune Enabled",
+            "description": "Run restic prune in the daily window (true/false).",
+            "env_variable": "PEB_PRUNE_ENABLED",
+            "default_value": "true",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Check Interval",
+            "description": "How often restic check runs, Go duration (168h = weekly, 0 = never).",
+            "env_variable": "PEB_CHECK_INTERVAL",
+            "default_value": "168h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Check Read Data Subset",
+            "description": "Optional. Extra data to read during restic check, e.g. 5%. Empty = metadata only.",
+            "env_variable": "PEB_CHECK_READ_DATA_SUBSET",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Repository Capacity",
+            "description": "Optional. Capacity of the repository target in bytes, for the 'full in N days' forecast.",
+            "env_variable": "PEB_REPO_CAPACITY_BYTES",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|numeric",
+            "field_type": "text"
+        },
+        {
+            "name": "ntfy Topic URL",
+            "description": "Optional. Full ntfy topic URL for failure notifications.",
+            "env_variable": "PEB_NTFY_URL",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "ntfy Token",
+            "description": "Optional. ntfy access token.",
+            "env_variable": "PEB_NTFY_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Maintenance Timeout",
+            "description": "Deadline for each maintenance job (Go duration). restic is killed after it.",
+            "env_variable": "PEB_MAINTENANCE_TIMEOUT",
+            "default_value": "3h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Maintenance Busy Wait",
+            "description": "How long maintenance waits for running backups/restores before skipping (Go duration).",
+            "env_variable": "PEB_MAINTENANCE_BUSY_WAIT",
+            "default_value": "15m",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Download Timeout",
+            "description": "Deadline for one restore/download (Go duration).",
+            "env_variable": "PEB_DOWNLOAD_TIMEOUT",
+            "default_value": "2h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "required|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Repository",
+            "description": "Optional. Second restic repository for the offsite copy, e.g. rclone:gdrive:peb (Google Drive via rclone), sftp:user@host:/path or s3:... Empty = no offsite copy. Must differ from the main repository.",
+            "env_variable": "PEB_SECONDARY_REPO",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Password",
+            "description": "Optional. Password of the offsite repository. Empty = same password as the main repository.",
+            "env_variable": "PEB_SECONDARY_PASSWORD",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Delay",
+            "description": "Optional. Quiet time after the last backup before the offsite copy starts (Go duration).",
+            "env_variable": "PEB_SECONDARY_DELAY",
+            "default_value": "5m",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Prune Skip Warning",
+            "description": "Warn (notification, status warning) after this many scheduled prune jobs in a row were skipped because the repository was busy. 0 = never.",
+            "env_variable": "PEB_PRUNE_SKIP_WARN",
+            "default_value": "2",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|integer|min:0|max:100",
+            "field_type": "text"
+        },
+        {
+            "name": "Trash Retention",
+            "description": "How long a backup deleted in the panel stays recoverable in the gateway trash before the nightly maintenance removes it (Go duration, 0 = forget immediately).",
+            "env_variable": "PEB_TRASH_RETENTION",
+            "default_value": "168h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Deleted Server Retention",
+            "description": "How long the backups of a server deleted in the panel are kept before they are removed (Go duration, 0 = at the next maintenance window).",
+            "env_variable": "PEB_ORPHAN_RETENTION",
+            "default_value": "720h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Trash Warning Size (GB)",
+            "description": "Send a notification 24 hours before the trash is emptied if at least this many GB of original backup data are affected. 0 = never.",
+            "env_variable": "PEB_TRASH_WARN_GB",
+            "default_value": "10",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|integer|min:0|max:100000",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Forget Grace",
+            "description": "Optional. A snapshot must be missing in the main repository this long before its offsite copy is forgotten (Go duration, 0 = no grace).",
+            "env_variable": "PEB_SECONDARY_FORGET_GRACE",
+            "default_value": "48h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Forget Release",
+            "description": "Optional, normally empty. Releases a stopped offsite forget step (more than 10% / 20 snapshots, or a changed repository ID): set it to the repository ID of the offsite repository shown in the notification, then remove it again.",
+            "env_variable": "PEB_SECONDARY_FORGET_CONFIRM",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "rclone Config",
+            "description": "Optional. Path of the rclone config file for rclone: repositories, e.g. /home/container/rclone.conf (the file lives in the server volume).",
+            "env_variable": "RCLONE_CONFIG",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        }
+    ]
+}

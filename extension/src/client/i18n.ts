@@ -28,3 +28,6 @@ export function useT() {
 
     return { t, locale };
 }
+
+/** Uebersetzungsschluessel des Wartungsjobs (Typen mit Bindestrich wie `forget-secondary` haben Unterstriche im Schluessel). */
+export const jobKey = (type: string): MessageKey => `job_${type.replace(/-/g, '_')}` as MessageKey;

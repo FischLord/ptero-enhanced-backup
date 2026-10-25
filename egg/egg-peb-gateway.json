@@ -139,6 +139,16 @@
             "field_type": "text"
         },
         {
+            "name": "Metrics Token",
+            "description": "Optional own bearer token for GET /metrics (Prometheus), at least 32 characters. Empty = the admin token is used; without either token /metrics is off.",
+            "env_variable": "PEB_METRICS_TOKEN",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|min:32|max:128",
+            "field_type": "text"
+        },
+        {
             "name": "Timezone",
             "description": "Local time zone for the maintenance window.",
             "env_variable": "TZ",
@@ -246,6 +256,106 @@
             "user_viewable": true,
             "user_editable": false,
             "rules": "required|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Repository",
+            "description": "Optional. Second restic repository for the offsite copy, e.g. rclone:gdrive:peb (Google Drive via rclone), sftp:user@host:/path or s3:... Empty = no offsite copy. Must differ from the main repository.",
+            "env_variable": "PEB_SECONDARY_REPO",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Password",
+            "description": "Optional. Password of the offsite repository. Empty = same password as the main repository.",
+            "env_variable": "PEB_SECONDARY_PASSWORD",
+            "default_value": "",
+            "user_viewable": false,
+            "user_editable": false,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Delay",
+            "description": "Optional. Quiet time after the last backup before the offsite copy starts (Go duration).",
+            "env_variable": "PEB_SECONDARY_DELAY",
+            "default_value": "5m",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Prune Skip Warning",
+            "description": "Warn (notification, status warning) after this many scheduled prune jobs in a row were skipped because the repository was busy. 0 = never.",
+            "env_variable": "PEB_PRUNE_SKIP_WARN",
+            "default_value": "2",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|integer|min:0|max:100",
+            "field_type": "text"
+        },
+        {
+            "name": "Trash Retention",
+            "description": "How long a backup deleted in the panel stays recoverable in the gateway trash before the nightly maintenance removes it (Go duration, 0 = forget immediately).",
+            "env_variable": "PEB_TRASH_RETENTION",
+            "default_value": "168h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Deleted Server Retention",
+            "description": "How long the backups of a server deleted in the panel are kept before they are removed (Go duration, 0 = at the next maintenance window).",
+            "env_variable": "PEB_ORPHAN_RETENTION",
+            "default_value": "720h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Trash Warning Size (GB)",
+            "description": "Send a notification 24 hours before the trash is emptied if at least this many GB of original backup data are affected. 0 = never.",
+            "env_variable": "PEB_TRASH_WARN_GB",
+            "default_value": "10",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|integer|min:0|max:100000",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Forget Grace",
+            "description": "Optional. A snapshot must be missing in the main repository this long before its offsite copy is forgotten (Go duration, 0 = no grace).",
+            "env_variable": "PEB_SECONDARY_FORGET_GRACE",
+            "default_value": "48h",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:16",
+            "field_type": "text"
+        },
+        {
+            "name": "Offsite Forget Release",
+            "description": "Optional, normally empty. Releases a stopped offsite forget step (more than 10% / 20 snapshots, or a changed repository ID): set it to the repository ID of the offsite repository shown in the notification, then remove it again.",
+            "env_variable": "PEB_SECONDARY_FORGET_CONFIRM",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "rclone Config",
+            "description": "Optional. Path of the rclone config file for rclone: repositories, e.g. /home/container/rclone.conf (the file lives in the server volume).",
+            "env_variable": "RCLONE_CONFIG",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": false,
+            "rules": "nullable|string|max:255",
             "field_type": "text"
         }
     ]

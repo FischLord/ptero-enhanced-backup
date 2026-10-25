@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Alert, Button, Checkbox, Dialog, Table, toast, type TableColumn } from '@pterodactyl/sdk';
 import { EXTENSION_ID, errorInfo, getMaintenance, keys, runMaintenance } from '../api';
 import { formatBytes, formatDateTime, formatDuration } from '../format';
-import { useT, type MessageKey } from '../i18n';
+import { jobKey, useT, type MessageKey } from '../i18n';
 import type { MaintenanceJob, MaintenanceJobName } from '../types';
 import { JobResultBadge, Muted } from './Common';
 import { Loaded } from './Loaded';
@@ -47,7 +47,7 @@ export default function MaintenanceView() {
 
     const columns: TableColumn<MaintenanceJob>[] = [
         { id: 'started', label: t('col_started'), cell: (j) => formatDateTime(j.started_at, locale) },
-        { id: 'type', label: t('col_job'), cell: (j) => t(`job_${j.type}` as MessageKey) },
+        { id: 'type', label: t('col_job'), cell: (j) => t(jobKey(j.type)) },
         { id: 'trigger', label: t('col_trigger'), cell: (j) => t(`trigger_${j.trigger}`) },
         { id: 'result', label: t('col_result'), cell: (j) => <JobResultBadge result={j.result} /> },
         { id: 'duration', label: t('col_duration'), cell: (j) => formatDuration(jobDuration(j)) },

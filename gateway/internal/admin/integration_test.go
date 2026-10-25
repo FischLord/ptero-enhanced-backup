@@ -224,6 +224,11 @@ func TestRealRestic_MaintenanceRun(t *testing.T) {
 	if e.mgr.Gate.Paused() {
 		t.Fatal("gate left paused")
 	}
+	// The per-server measurement uses the real "server:<uuid>" tag.
+	ss, err := e.st.ServerStats(ctx)
+	if err != nil || ss["srv-1"].StoredBytes <= 0 || ss["srv-1"].StoredBytes > rs.TotalSize {
+		t.Fatalf("server stats: %+v (repo %d) %v", ss, rs.TotalSize, err)
+	}
 
 	// And through the API.
 	m := decode(t, e.get(t, "/maintenance"), 200)

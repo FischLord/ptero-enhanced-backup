@@ -30,6 +30,7 @@ type Limits struct {
 	MaxSpoolBytes int64         // total spooled bytes, <= 0 unlimited
 	MaxIngests    int           // concurrent restic backups
 	MaxIndexFiles int           // tar members recorded per backup, <= 0 unlimited
+	NoIndexHash   bool          // do not compute the SHA-256 of regular files for the index
 	IngestTimeout time.Duration // deadline for the pipeline after Complete, <= 0 none
 }
 
@@ -48,6 +49,9 @@ type Manager struct {
 	Gate *gate.Gate
 	// OnDone, if set, is called after every pipeline that was not aborted. It must not block.
 	OnDone func(DoneEvent)
+	// OnAbandoned, if set, is called once per backup whose upload never finished
+	// (found pending at start, or dropped for inactivity). It must not block.
+	OnAbandoned func(AbandonedEvent)
 
 	queued, running atomic.Int64
 	limits          Limits
@@ -76,6 +80,12 @@ type DoneEvent struct {
 	ServerUUID, BackupUUID string
 	OK                     bool
 	TimedOut               bool
+}
+
+// AbandonedEvent describes an upload that was dropped without being completed.
+type AbandonedEvent struct {
+	ServerUUID, BackupUUID string
+	Reason                 string
 }
 
 // Load returns the pipelines that currently run restic and those waiting for a slot.
@@ -124,9 +134,19 @@ func (m *Manager) Configure(l Limits) {
 // Recover cleans up after a crash: running uploads are lost, so their rows
 // are failed and the spool is emptied.
 func (m *Manager) Recover(ctx context.Context) error {
+	pending, err := m.Store.PendingBackups(ctx)
+	if err != nil {
+		return err
+	}
 	n, err := m.Store.FailStale(ctx, time.Now())
 	if err != nil {
 		return err
+	}
+	if m.OnAbandoned != nil {
+		for _, p := range pending {
+			m.OnAbandoned(AbandonedEvent{ServerUUID: p.ServerUUID, BackupUUID: p.BackupUUID,
+				Reason: "upload abandoned (gateway restarted during the upload) - likely a Wings/Docker restart; Wings does not retry, the backup is missing"})
+		}
 	}
 	if n > 0 {
 		m.Log.Warn("marked interrupted backups as failed", "count", n)
@@ -241,6 +261,25 @@ func (m *Manager) Done(id string) <-chan struct{} {
 	return u.done
 }
 
+// Fail ends an upload that is still receiving parts: the pipeline is stopped,
+// the backup row becomes "failed" with reason, the spool is released and
+// further parts and Complete are answered with ErrPipelineFailed.
+func (m *Manager) Fail(id string, reason error) {
+	u, err := m.Get(id)
+	if err != nil {
+		return
+	}
+	u.mu.Lock()
+	if u.completed || u.aborted || u.failure != nil {
+		u.mu.Unlock()
+		return
+	}
+	u.failure = reason
+	u.broadcast()
+	u.mu.Unlock()
+	u.cancel()
+}
+
 // Abort stops the pipeline, removes the spool and forgets any snapshot.
 func (m *Manager) Abort(id string) error {
 	u, err := m.Get(id)
@@ -274,16 +313,19 @@ func (m *Manager) remove(id string) {
 // Reap aborts uploads that have been idle for IdleLimit; run it periodically.
 func (m *Manager) Reap() {
 	m.mu.Lock()
-	var stale []string
+	stale := map[string]*Upload{}
 	for id, u := range m.uploads {
 		if !u.isCompleted() && time.Since(u.idleSince()) > m.IdleLimit {
-			stale = append(stale, id)
+			stale[id] = u
 		}
 	}
 	m.mu.Unlock()
-	for _, id := range stale {
+	for id, u := range stale {
 		m.Log.Warn("aborting idle upload", "upload", id)
-		_ = m.Abort(id)
+		if m.Abort(id) == nil && m.OnAbandoned != nil {
+			m.OnAbandoned(AbandonedEvent{ServerUUID: u.ServerUUID, BackupUUID: u.BackupUUID,
+				Reason: "upload abandoned (no activity for " + m.IdleLimit.Round(time.Minute).String() + ") - likely a Wings/Docker restart; Wings does not retry, the backup is missing"})
+		}
 	}
 }
 
@@ -334,11 +376,24 @@ func (m *Manager) run(ctx context.Context, u *Upload) {
 	var err error
 	// Parts keep being accepted while we wait for a free slot; only consumption waits.
 	if err = m.acquire(ctx); err == nil {
+		u.mu.Lock()
+		u.hasSlot.Store(true)
+		u.broadcast() // part writers waiting for space may now be admitted
+		u.mu.Unlock()
 		pr, err = m.process(ctx, u)
+		u.hasSlot.Store(false)
 		m.release()
 	}
 	if err != nil && u.timedOut.Load() {
 		err = errors.New("ingest timeout exceeded")
+	}
+	if err != nil {
+		// Fail() cancelled the pipeline; report why, not "context canceled".
+		u.mu.Lock()
+		if u.failure != nil && !u.aborted {
+			err = u.failure
+		}
+		u.mu.Unlock()
 	}
 
 	// Finalisation must not be cut short: a good snapshot has to be recorded.
@@ -450,7 +505,7 @@ func (m *Manager) process(ctx context.Context, u *Upload) (procResult, error) {
 
 	cr := &countReader{r: gz}
 	tee := io.TeeReader(cr, pw)
-	files, truncated, idxErr := indexTar(tee, m.limits.MaxIndexFiles)
+	files, truncated, idxErr := indexTarHash(tee, m.limits.MaxIndexFiles, !m.limits.NoIndexHash)
 	if idxErr == nil {
 		// Consume trailing padding so restic gets every byte and gzip verifies its checksum.
 		_, idxErr = io.Copy(io.Discard, tee)

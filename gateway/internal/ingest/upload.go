@@ -33,14 +33,21 @@ var (
 	ErrBadPartNumber  = errors.New("part number must be between 1 and 10000")
 	ErrPipelineFailed = errors.New("ingest pipeline failed")
 	ErrSpoolFull      = errors.New("spool quota exceeded")
+	ErrSpoolTimeout   = errors.New("timed out waiting for free spool space")
+	ErrSpoolIO        = errors.New("writing the part to the spool failed")
+	ErrBodyRead       = errors.New("request body was not received completely")
 	ErrBadSHA256      = errors.New("x-amz-content-sha256 does not match the body")
 	ErrBadDigest      = errors.New("Content-MD5 does not match the body")
 )
 
-// Quota limits the total bytes spooled to disk across all uploads.
+// Quota limits the total bytes spooled to disk across all uploads. Writers
+// that do not fit wait for space instead of failing (see Upload.reserve).
 type Quota struct {
 	Max  int64 // <= 0 means unlimited
 	used atomic.Int64
+
+	mu   sync.Mutex
+	wake chan struct{} // closed (and replaced) whenever space is released
 }
 
 func (q *Quota) tryReserve(n int64) bool {
@@ -59,9 +66,29 @@ func (q *Quota) tryReserve(n int64) bool {
 }
 
 func (q *Quota) add(n int64) {
-	if q != nil {
-		q.used.Add(n)
+	if q == nil {
+		return
 	}
+	q.used.Add(n)
+	if n < 0 {
+		q.mu.Lock()
+		if q.wake != nil {
+			close(q.wake)
+			q.wake = nil
+		}
+		q.mu.Unlock()
+	}
+}
+
+// waiter returns a channel that is closed the next time space is released.
+// Fetch it before the reservation attempt so no release is missed.
+func (q *Quota) waiter() <-chan struct{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.wake == nil {
+		q.wake = make(chan struct{})
+	}
+	return q.wake
 }
 
 // Used returns the currently spooled bytes.
@@ -77,6 +104,10 @@ type PutOptions struct {
 	Size   int64  // declared Content-Length, -1 if unknown (used to reserve spool quota)
 	SHA256 string // expected hex SHA-256 of the body, if signed
 	MD5    string // expected base64 MD5 (Content-MD5 header)
+	// WaitTimeout bounds how long a part waits for free spool space. <= 0: do not
+	// wait, fail at once with ErrSpoolFull. Ctx (optional) cancels the wait.
+	WaitTimeout time.Duration
+	Ctx         context.Context
 }
 
 type partState struct {
@@ -123,6 +154,7 @@ type Upload struct {
 	sig   string // signature of the part list given to Complete
 
 	consumed     atomic.Int64 // compressed bytes handed to the pipeline
+	hasSlot      atomic.Bool  // the pipeline holds an ingest slot (set by Manager.run)
 	timedOut     atomic.Bool
 	deadlineOnce sync.Once
 	timer        *time.Timer
@@ -182,8 +214,8 @@ func (u *Upload) PutPartOpts(n int, body io.Reader, o PutOptions) (string, error
 
 	var held int64
 	if o.Size > 0 {
-		if !u.quota.tryReserve(o.Size) {
-			return "", ErrSpoolFull
+		if err := u.reserve(n, o); err != nil {
+			return "", err
 		}
 		held = o.Size
 	}
@@ -196,7 +228,13 @@ func (u *Upload) PutPartOpts(n int, body io.Reader, o PutOptions) (string, error
 
 	tmp, err := os.CreateTemp(u.dir, "part-*.tmp")
 	if err != nil {
-		return "", err
+		u.mu.Lock()
+		cerr := u.closedErr() // the spool dir vanishes when the pipeline ends
+		u.mu.Unlock()
+		if cerr != nil {
+			return "", cerr
+		}
+		return "", fmt.Errorf("%w: %v", ErrSpoolIO, err)
 	}
 	defer os.Remove(tmp.Name()) // no-op after a successful rename
 	md := md5.New()
@@ -206,14 +244,26 @@ func (u *Upload) PutPartOpts(n int, body io.Reader, o PutOptions) (string, error
 		sh = sha256.New()
 		w = append(w, sh)
 	}
-	size, err := io.Copy(io.MultiWriter(w...), body)
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
+	br := &errReader{r: body}
+	size, err := io.Copy(io.MultiWriter(w...), br)
+	if cerr := tmp.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("%w: %v", ErrSpoolIO, cerr)
 	}
 	u.quota.add(size - held)
 	held = size
 	if err != nil {
+		if br.err != nil && !errors.Is(err, ErrSpoolIO) {
+			return "", errors.Join(ErrBodyRead, err) // client side: aborted or short body
+		}
+		if !errors.Is(err, ErrSpoolIO) {
+			err = fmt.Errorf("%w: %v", ErrSpoolIO, err)
+		}
 		return "", err
+	}
+	// Wings sends no Content-MD5, so the declared length is the only integrity
+	// check on the wire: a part is only ever acknowledged if it is complete.
+	if o.Size >= 0 && size != o.Size {
+		return "", fmt.Errorf("%w: received %d of %d bytes", ErrBodyRead, size, o.Size)
 	}
 	etag := hex.EncodeToString(md.Sum(nil))
 	if sh != nil && hex.EncodeToString(sh.Sum(nil)) != strings.ToLower(o.SHA256) {
@@ -252,6 +302,94 @@ func (u *Upload) PutPartOpts(n int, body io.Reader, o PutOptions) (string, error
 	u.parts[n] = &partState{size: size, etag: etag, modTime: time.Now()}
 	u.broadcast()
 	return etag, nil
+}
+
+// errReader remembers whether an error came from the request body.
+type errReader struct {
+	r   io.Reader
+	err error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && err != io.EOF {
+		e.err = err
+	}
+	return n, err
+}
+
+// reserve claims o.Size bytes of spool quota. When the spool is full it blocks
+// until consumption frees space, the upload dies, ctx ends or WaitTimeout
+// passes. Blocking (instead of an error) matters: Wings retries a failed
+// UploadPart with a half-read body, which can never succeed.
+//
+// Exception: the part the running pipeline is waiting for (hasSlot and n ==
+// next) is always admitted, overbooking the quota by at most one part per
+// slot. Otherwise slot holders could wait for a part that waits for space
+// occupied by queued uploads, which only move once a slot is free (a cycle
+// that would only end when the wait times out).
+func (u *Upload) reserve(n int, o PutOptions) error {
+	q := u.quota
+	if q == nil || q.tryReserve(o.Size) {
+		return nil
+	}
+	if q.Max > 0 && o.Size > q.Max {
+		return fmt.Errorf("%w: a part of %d bytes can never fit into a spool of %d bytes", ErrSpoolFull, o.Size, q.Max)
+	}
+	if u.pipelineWaitsFor(n) {
+		q.add(o.Size)
+		return nil
+	}
+	if o.WaitTimeout <= 0 {
+		return ErrSpoolFull
+	}
+	ctx := o.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(o.WaitTimeout)
+	defer timer.Stop()
+	poll := time.NewTicker(time.Second) // safety net, e.g. when Max is raised at runtime
+	defer poll.Stop()
+	for {
+		wake := q.waiter()
+		if q.tryReserve(o.Size) {
+			return nil
+		}
+		if u.pipelineWaitsFor(n) {
+			q.add(o.Size)
+			return nil
+		}
+		u.mu.Lock()
+		err := u.closedErr()
+		if err == nil && u.completed {
+			err = ErrNoSuchUpload
+		}
+		un := u.notify
+		u.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		select {
+		case <-wake:
+		case <-un:
+		case <-poll.C:
+		case <-timer.C:
+			return fmt.Errorf("%w (%s)", ErrSpoolTimeout, o.WaitTimeout)
+		case <-ctx.Done():
+			return errors.Join(ErrBodyRead, ctx.Err())
+		}
+	}
+}
+
+// pipelineWaitsFor reports whether the running pipeline needs part n next.
+func (u *Upload) pipelineWaitsFor(n int) bool {
+	if !u.hasSlot.Load() {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.next == n
 }
 
 // releaseConsumed returns the quota of a part that was consumed and deleted.
@@ -398,6 +536,7 @@ func (u *Upload) openNext(ctx context.Context) (*os.File, int64, error) {
 			}
 			p.started = true
 			u.next++
+			u.broadcast() // a writer waiting for the following part may now be admitted
 			return f, p.size, nil
 		}
 		ch := u.notify

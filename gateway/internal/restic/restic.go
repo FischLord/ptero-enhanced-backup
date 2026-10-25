@@ -11,10 +11,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+)
+
+// cancelSignal is sent to restic when its context ends; killDelay is how long
+// it then gets to remove its repository lock before it is killed.
+const (
+	cancelSignal = syscall.SIGTERM
+	killDelay    = 15 * time.Second
 )
 
 // Client runs restic against one repository.
@@ -24,6 +32,15 @@ type Client struct {
 	Password     string
 	PasswordFile string
 	CacheDir     string
+	// TmpDir is where restic writes temporary pack files (TMPDIR). Wings mounts
+	// /tmp as a 100 MB tmpfs, too small for a copy. An operator-set TMPDIR wins.
+	TmpDir string
+
+	// Source repository for copy and init --copy-chunker-params (passed by
+	// environment, so credentials never show up in the process list).
+	FromRepo         string
+	FromPassword     string
+	FromPasswordFile string
 }
 
 // Summary is the final "summary" message of `restic backup --json`.
@@ -49,11 +66,23 @@ type BackupOptions struct {
 type Snapshot struct {
 	ID   string   `json:"id"`
 	Tags []string `json:"tags"`
+	// Original is the ID of the source snapshot if this one was made by `restic copy`.
+	Original string `json:"original"`
 }
 
 func (c *Client) command(ctx context.Context, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, c.bin(), args...)
-	env := append(os.Environ(), "RESTIC_REPOSITORY="+c.Repo, "RESTIC_PROGRESS_FPS=0.1")
+	env := cleanEnv(os.Environ())
+	env = append(env, "RESTIC_REPOSITORY="+c.Repo, "RESTIC_PROGRESS_FPS=0.1")
+	if c.FromRepo != "" {
+		env = append(env, "RESTIC_FROM_REPOSITORY="+c.FromRepo)
+	}
+	if c.FromPasswordFile != "" {
+		env = append(env, "RESTIC_FROM_PASSWORD_FILE="+c.FromPasswordFile)
+	}
+	if c.FromPassword != "" {
+		env = append(env, "RESTIC_FROM_PASSWORD="+c.FromPassword)
+	}
 	if c.PasswordFile != "" {
 		env = append(env, "RESTIC_PASSWORD_FILE="+c.PasswordFile)
 	}
@@ -63,11 +92,44 @@ func (c *Client) command(ctx context.Context, args ...string) *exec.Cmd {
 	if c.CacheDir != "" {
 		env = append(env, "RESTIC_CACHE_DIR="+c.CacheDir)
 	}
+	if c.TmpDir != "" && os.Getenv("TMPDIR") == "" {
+		env = append(env, "TMPDIR="+c.TmpDir)
+	}
 	cmd.Env = env
 	// Ask restic to shut down cleanly (removes its repository lock) before killing it.
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = 15 * time.Second
+	cmd.Cancel = func() error { return cmd.Process.Signal(cancelSignal) }
+	cmd.WaitDelay = killDelay
 	return cmd
+}
+
+// cleanEnv drops the restic repository and password variables of the process, so
+// every Client uses exactly its own settings (a second repository must not
+// inherit the first one's password).
+func cleanEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, _, _ := strings.Cut(kv, "=")
+		switch k {
+		case "RESTIC_REPOSITORY", "RESTIC_REPOSITORY_FILE", "RESTIC_PASSWORD", "RESTIC_PASSWORD_FILE", "RESTIC_PASSWORD_COMMAND",
+			"RESTIC_FROM_REPOSITORY", "RESTIC_FROM_REPOSITORY_FILE", "RESTIC_FROM_PASSWORD", "RESTIC_FROM_PASSWORD_FILE", "RESTIC_FROM_PASSWORD_COMMAND":
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// CleanTmp removes restic-temp-pack-* files left in dir by an interrupted run.
+// Only call it while no restic process is running. Returns the number removed.
+func CleanTmp(dir string) int {
+	files, _ := filepath.Glob(filepath.Join(dir, "restic-temp-pack-*"))
+	n := 0
+	for _, f := range files {
+		if fi, err := os.Lstat(f); err == nil && fi.Mode().IsRegular() && os.Remove(f) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (c *Client) bin() string {
@@ -166,6 +228,12 @@ func (c *Client) Forget(ctx context.Context, snapshotID string) error {
 		return nil
 	}
 	return err
+}
+
+// ForgetRaw is Forget for callers that hold the gate themselves (maintenance).
+// Gated.Forget would wait for the paused gate and never return.
+func (c *Client) ForgetRaw(ctx context.Context, snapshotID string) error {
+	return c.Forget(ctx, snapshotID)
 }
 
 func isNoSnapshot(err error) bool {

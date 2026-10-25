@@ -6,14 +6,17 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use PebBackups\Gateway\GatewayClient;
 use PebBackups\Services\Insights;
+use PebBackups\Services\ServerReconciler;
 
 class OverviewController
 {
     /** Status, Kennzahlen und Tagesverlauf in einem Aufruf, dazu die berechneten Einsparungen. */
-    public function __invoke(Request $request, GatewayClient $gateway): JsonResponse
+    public function __invoke(Request $request, GatewayClient $gateway, ServerReconciler $reconciler): JsonResponse
     {
         $data = $request->validate(['days' => ['sometimes', 'integer', 'min:1', 'max:365']]);
         $config = $gateway->config();
+        // Geloeschte Server sofort erkennen, auch wenn das Ereignis oder der Stundenlauf fehlte (hoechstens alle 5 Minuten).
+        $reconciler->reconcileQuietly();
 
         ['status' => $status, 'summary' => $summary, 'history' => $history] = $gateway->getMany([
             'status' => ['status'],

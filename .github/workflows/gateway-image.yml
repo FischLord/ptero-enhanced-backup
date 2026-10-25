@@ -47,8 +47,17 @@ jobs:
             type=match,pattern=gateway-v(.*),group=1
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/gateway-v') }}
             type=raw,value=dev,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+      # gateway-vX.Y.Z -> X.Y.Z; other runs keep the default version from main.go.
+      - id: ver
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/gateway-v*) echo "version=${GITHUB_REF#refs/tags/gateway-v}" >> "$GITHUB_OUTPUT" ;;
+            *) echo "version=" >> "$GITHUB_OUTPUT" ;;
+          esac
       - uses: docker/build-push-action@v6
         with:
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
           context: gateway
           file: gateway/Dockerfile
           push: true

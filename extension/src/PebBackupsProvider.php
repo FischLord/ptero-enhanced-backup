@@ -2,10 +2,17 @@
 
 namespace PebBackups;
 
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use PebBackups\Gateway\GatewayClient;
 use PebBackups\Gateway\GatewayConfig;
 use PebBackups\Pro\ProRegistry;
+use PebBackups\Setup\PanelAdapter;
+use PebBackups\Setup\PanelBridge;
+use PebBackups\Setup\PanelS3Prober;
+use PebBackups\Services\ServerReconciler;
+use PebBackups\Setup\S3Prober;
+use Pterodactyl\Events\Server\OperationCompleted;
 use Pterodactyl\Extensions\ExtensionProvider;
 use Pterodactyl\Services\Extensions\ExtensionSettingDefinition;
 use Pterodactyl\Services\Extensions\ExtensionSettingsDefinition;
@@ -28,6 +35,9 @@ class PebBackupsProvider extends ExtensionProvider
             $app->make(HttpFactory::class),
             $app->make(GatewayConfig::class),
         ));
+        // Einrichtungsassistent: Zugriffe auf interne Panel-Klassen nur ueber diese Adapter.
+        $this->app->bind(PanelBridge::class, PanelAdapter::class);
+        $this->app->bind(S3Prober::class, PanelS3Prober::class);
     }
 
     public function boot(): void
@@ -35,6 +45,24 @@ class PebBackupsProvider extends ExtensionProvider
         // routes/admin.php -> /api/admin/extensions/peb-backups (nur Root-Admins)
         $this->registerApiRoutes();
         $this->loadExtensionTranslations();
+
+        // Papierkorb fuer Server-Loeschung (Panel-Luecke #2564): Das Loeschen eines Servers entfernt seine
+        // Backup-Zeilen per Kaskade, ohne DeleteObject ans Gateway. Sofort per Ereignis, zur Sicherheit
+        // zusaetzlich stuendlich als Abgleich der Serverliste (und beim Oeffnen des Dashboards).
+        $this->listenToServerOperations(function (OperationCompleted $event): void {
+            if ($event->operation === 'delete' && $event->successful) {
+                $this->app->make(ServerReconciler::class)->markDeleted($event->serverUuid);
+            }
+        });
+        $this->registerSchedule(function (Schedule $schedule): void {
+            $schedule->call(function (): void {
+                try {
+                    $this->app->make(ServerReconciler::class)->reconcile();
+                } catch (\Throwable) {
+                    // Gateway nicht erreichbar: der naechste Lauf versucht es erneut.
+                }
+            })->name('peb-backups-reconcile')->hourly()->withoutOverlapping(10);
+        });
 
         $this->registerSettings(new ExtensionSettingsDefinition($this->settings(), [
             ExtensionSettingDefinition::make('gateway_url', 'gateway_url', '', ['nullable', 'url:http,https', 'max:255'])

@@ -179,3 +179,60 @@ func TestMigrateAddsTargetColumnsToOldDatabase(t *testing.T) {
 		s.Close()
 	}
 }
+
+func TestServerStats(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Now()
+	for _, c := range []struct{ srv, bk, snap string }{{"b", "1", "s1"}, {"a", "2", "s2"}, {"a", "3", "s3"}, {"c", "4", ""}} {
+		id, _ := st.CreateUpload(ctx, "u"+c.bk, c.srv+"/"+c.bk, c.srv, c.bk, now)
+		if c.snap != "" {
+			st.CompleteBackup(ctx, id, Finish{SnapshotID: c.snap}, now)
+		}
+	}
+	srv, err := st.ServersWithSnapshots(ctx)
+	if err != nil || len(srv) != 2 || srv[0] != "a" || srv[1] != "b" {
+		t.Fatalf("servers: %v %v", srv, err)
+	}
+	if err := st.SetServerStat(ctx, "a", 10, now); err != nil {
+		t.Fatal(err)
+	}
+	st.SetServerStat(ctx, "a", 20, now.Add(time.Second)) // replaces
+	st.SetServerStat(ctx, "b", 30, now)
+	got, _ := st.ServerStats(ctx)
+	if len(got) != 2 || got["a"].StoredBytes != 20 || got["a"].MeasuredAt.UnixMilli() != now.Add(time.Second).UnixMilli() {
+		t.Fatalf("stats: %+v", got)
+	}
+	if err := st.DeleteServerStatsExcept(ctx, []string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.ServerStats(ctx)
+	if len(got) != 1 || got["b"].StoredBytes != 30 {
+		t.Fatalf("after delete: %+v", got)
+	}
+}
+
+func TestOpenKeepsOldDatabaseUsable(t *testing.T) {
+	// A database from an older version has no server_stats table; Open adds it.
+	path := filepath.Join(t.TempDir(), "db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE repo_stats (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, total_size INTEGER NOT NULL, total_uncompressed_size INTEGER NOT NULL, snapshots_count INTEGER NOT NULL, compression_ratio REAL NOT NULL DEFAULT 0, disk_bytes INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.SetServerStat(context.Background(), "a", 1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}

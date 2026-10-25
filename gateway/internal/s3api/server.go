@@ -38,13 +38,18 @@ type Server struct {
 	Bucket   string
 	Verifier *s3auth.Verifier
 	Ingest   *ingest.Manager
-	Store    *store.Store
-	Restic   Restic
-	Log      *slog.Logger
+	// getUpload replaces Ingest.Get in tests.
+	getUpload func(id string) (*ingest.Upload, error)
+	Store     *store.Store
+	Restic    Restic
+	Log       *slog.Logger
 	// WaitTimeout bounds how long GetObject waits for a running ingest.
 	WaitTimeout time.Duration
 	// PublicURL, if set, is used for the Location of CompleteMultipartUpload results.
 	PublicURL string
+	// SpoolWait bounds how long an UploadPart waits for free spool space (backpressure)
+	// before the whole upload is failed. 0 means 60 minutes, negative means no waiting.
+	SpoolWait time.Duration
 	// MaxPartBytes caps a single UploadPart body (default 1 GiB).
 	MaxPartBytes int64
 	// MaxDumps limits concurrent restores (default 2); DumpWait bounds the wait for a slot.
@@ -52,6 +57,10 @@ type Server struct {
 	DumpWait time.Duration
 	// DeleteWait bounds how long DeleteObject waits for a running ingest.
 	DeleteWait time.Duration
+	// TrashRetention: DeleteObject moves a backup with a snapshot into the trash for this long
+	// instead of forgetting it (0 = forget at once). TrashNow replaces time.Now in tests.
+	TrashRetention time.Duration
+	TrashNow       func() time.Time
 	// DownloadTimeout bounds a whole restore/download (default 2h).
 	DownloadTimeout time.Duration
 	// Gate, if set, holds back new restores while maintenance needs the repository.
@@ -68,6 +77,16 @@ func (s *Server) maxPart() int64 {
 		return s.MaxPartBytes
 	}
 	return 1 << 30
+}
+
+func (s *Server) spoolWait() time.Duration {
+	switch {
+	case s.SpoolWait == 0:
+		return time.Hour
+	case s.SpoolWait < 0:
+		return 0
+	}
+	return s.SpoolWait
 }
 
 func (s *Server) dumpSlots() chan struct{} {
@@ -150,7 +169,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"bytes", sw.n, "dur", time.Since(start).Round(time.Millisecond), "id", reqID)
 	}()
 
-	if err := s.handle(sw, r, reqID); err != nil {
+	authed := false
+	if err := s.handle(sw, r, reqID, &authed); err != nil {
+		if r.Method == http.MethodPut && r.URL.Query().Has("partNumber") {
+			// Read the part body to its end before any error status, whatever the
+			// reason (bucket, unsupported request): otherwise the connection is
+			// reset and Wings sees a transport error and retries with a spent body.
+			// Only for a verified signature: an unauthenticated client gets a bounded
+			// drain and the connection is closed, so it cannot tie up a handler.
+			if authed {
+				_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, s.maxPart()+1))
+			} else {
+				_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, unauthDrainMax))
+				sw.Header().Set("Connection", "close")
+			}
+		}
 		var ae *apiError
 		if !errors.As(err, &ae) {
 			s.Log.Error("internal error", "err", err, "id", reqID)
@@ -160,7 +193,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handle(w http.ResponseWriter, r *http.Request, reqID string) error {
+// unauthDrainMax bounds how much body is read for a request whose signature failed.
+const unauthDrainMax = 1 << 20
+
+// handle sets *authed once the signature has been verified.
+func (s *Server) handle(w http.ResponseWriter, r *http.Request, reqID string, authed *bool) error {
 	w.Header().Set("x-amz-request-id", reqID)
 	w.Header().Set("Server", "peb-gateway")
 
@@ -173,6 +210,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request, reqID string) er
 		}
 		return err
 	}
+	*authed = true
 	if strings.HasPrefix(auth.PayloadHash, "STREAMING-") {
 		return newErr(501, "NotImplemented", "aws-chunked uploads are not supported")
 	}
@@ -215,7 +253,14 @@ func parseKey(key string) (server, backup string, ok bool) {
 }
 
 func (s *Server) upload(key, id string) (*ingest.Upload, error) {
-	u, err := s.Ingest.Get(id)
+	get := s.Ingest.Get
+	if s.getUpload != nil {
+		get = s.getUpload
+	}
+	u, err := get(id)
+	if err != nil && !errors.Is(err, ingest.ErrNoSuchUpload) {
+		return nil, err
+	}
 	if err != nil || u.Key != key {
 		return nil, newErr(404, "NoSuchUpload", "The specified upload does not exist.")
 	}
@@ -224,7 +269,13 @@ func (s *Server) upload(key, id string) (*ingest.Upload, error) {
 
 // uploadErr translates ingest errors. Internal details are logged, never sent.
 func (s *Server) uploadErr(err error) error {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return newErr(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+	}
 	switch {
+	case errors.Is(err, ingest.ErrBodyRead):
+		return newErr(400, "IncompleteBody", "You did not provide the number of bytes specified by the Content-Length HTTP header")
 	case errors.Is(err, ingest.ErrNoSuchUpload):
 		return newErr(404, "NoSuchUpload", "The specified upload does not exist or was already completed or aborted.")
 	case errors.Is(err, ingest.ErrBadPartNumber):
@@ -235,19 +286,19 @@ func (s *Server) uploadErr(err error) error {
 		return newErr(400, "InvalidPart", err.Error())
 	case errors.Is(err, ingest.ErrPartConflict):
 		return newErr(409, "OperationAborted", err.Error())
-	case errors.Is(err, ingest.ErrSpoolFull):
-		return newErr(503, "SlowDown", "The gateway spool is full. Please retry later.")
+	case errors.Is(err, ingest.ErrSpoolTimeout), errors.Is(err, ingest.ErrSpoolFull):
+		// Deliberately 4xx: Wings retries 5xx with the half-read body of the failed attempt.
+		return newErr(409, "OperationAborted", "The gateway spool stayed full; the upload was aborted: "+err.Error())
+	case errors.Is(err, ingest.ErrSpoolIO):
+		s.Log.Error("spool write failed", "err", err)
+		return newErr(409, "OperationAborted", "The gateway could not store the part; the upload was aborted. See the gateway log.")
 	case errors.Is(err, ingest.ErrBadSHA256):
 		return newErr(400, "XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.")
 	case errors.Is(err, ingest.ErrBadDigest):
 		return newErr(400, "BadDigest", "The Content-MD5 you specified did not match what we received.")
 	case errors.Is(err, ingest.ErrPipelineFailed):
 		s.Log.Error("upload pipeline failed", "err", err)
-		return newErr(500, "InternalError", "Processing of this upload failed. See the gateway log.")
-	}
-	var mbe *http.MaxBytesError
-	if errors.As(err, &mbe) {
-		return newErr(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
+		return newErr(409, "OperationAborted", "Processing of this upload failed and it was aborted. See the gateway log.")
 	}
 	return err
 }
@@ -273,11 +324,34 @@ func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, key str
 	return nil
 }
 
+// uploadPart never answers 5xx: Wings retries those with the same, partly
+// consumed body, which can only fail (or worse). Errors are 4xx, and the body
+// is drained first (in ServeHTTP) so that the client reliably sees the response.
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key, uploadID, partNo string, auth *s3auth.Result) error {
 	u, err := s.upload(key, uploadID)
 	if err != nil {
+		var ae *apiError
+		if !errors.As(err, &ae) {
+			// A failed lookup says nothing about the upload itself: answer 4xx, do not fail it.
+			s.Log.Error("upload lookup failed", "err", err, "upload", uploadID)
+			err = newErr(409, "OperationAborted", "The gateway could not look up the upload. Please try again later.")
+		}
 		return err
 	}
+	err = s.uploadPartBody(w, r, u, uploadID, partNo, auth)
+	if err != nil {
+		var ae *apiError
+		if !errors.As(err, &ae) {
+			// Unexpected internal failure: stop this upload instead of leaving the client to retry.
+			s.Log.Error("upload part failed", "err", err, "upload", uploadID)
+			s.Ingest.Fail(uploadID, fmt.Errorf("internal error while receiving a part: %v", err))
+			err = newErr(409, "OperationAborted", "The gateway could not store the part; the upload was aborted. See the gateway log.")
+		}
+	}
+	return err
+}
+
+func (s *Server) uploadPartBody(w http.ResponseWriter, r *http.Request, u *ingest.Upload, uploadID, partNo string, auth *s3auth.Result) error {
 	n, err := strconv.Atoi(partNo)
 	if err != nil {
 		return newErr(400, "InvalidArgument", "Part number must be an integer between 1 and 10000, inclusive")
@@ -291,13 +365,17 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, key, uploadI
 	if r.ContentLength > s.maxPart() {
 		return newErr(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size")
 	}
-	opts := ingest.PutOptions{Size: r.ContentLength, MD5: r.Header.Get("Content-MD5")}
+	opts := ingest.PutOptions{Size: r.ContentLength, MD5: r.Header.Get("Content-MD5"),
+		WaitTimeout: s.spoolWait(), Ctx: r.Context()}
 	if !auth.Presigned && len(auth.PayloadHash) == 64 {
 		opts.SHA256 = auth.PayloadHash
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxPart())
 	etag, err := u.PutPartOpts(n, body, opts)
 	if err != nil {
+		if errors.Is(err, ingest.ErrSpoolTimeout) || errors.Is(err, ingest.ErrSpoolFull) || errors.Is(err, ingest.ErrSpoolIO) {
+			s.Ingest.Fail(uploadID, fmt.Errorf("upload aborted: %v (is the restic ingest slower than the upload? see PEB_SPOOL_WAIT_TIMEOUT, PEB_MAX_SPOOL_BYTES)", err))
+		}
 		return s.uploadErr(err)
 	}
 	if err := s.Store.UpsertPart(r.Context(), uploadID, n, r.ContentLength, etag); err != nil {
@@ -572,6 +650,17 @@ func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, key string
 				return err
 			}
 		}
+	}
+	if b.SnapshotID != "" && b.Status == store.StatusComplete && s.TrashRetention > 0 {
+		now := time.Now()
+		if s.TrashNow != nil {
+			now = s.TrashNow()
+		}
+		if err := s.Store.TrashBackup(ctx, b.ID, now, now.Add(s.TrashRetention), store.ReasonPanelDelete); err != nil {
+			return err
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return nil
 	}
 	if b.SnapshotID != "" {
 		// Forget waits while maintenance holds the repository; ask the client to retry then.

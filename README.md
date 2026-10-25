@@ -11,10 +11,16 @@ Pterodactyl and Wings are never modified. PEB only uses official interfaces: the
 - Incremental, deduplicated storage with restic, also across servers
 - Works with the native Backups tab: create, restore, download and delete as before
 - Gateway as a Pterodactyl server (egg + Docker image): console, logs and limits via the Panel
+- Setup wizard in the extension: pre-check, egg import, gateway server with generated secrets, copy-ready `.env` and Wings snippets, and a self-test
+- Backpressure instead of errors: when the spool is full, uploads wait for space instead of failing with a 5xx, so large backups survive Wings retries
+- Trash: backups deleted in the Panel, and backups of deleted servers, stay recoverable for a configurable time before they are removed for good
+- Offsite copy: one secondary restic repository (including Google Drive through rclone), with safety limits against accidental mass deletion
 - Daily maintenance window: `prune`, `check`, repository statistics, with a history of every job
-- Admin dashboard: savings (GB, %, factor, cost), storage target usage and forecast, 30-day history, per-server status with warnings
-- File browser per backup with single-file download, without restoring the whole server
-- Notifications for failed backups and maintenance (ntfy)
+- Admin dashboard: savings (GB, %, factor, cost), storage target usage and forecast, 30-day history, per-server status with warnings, and the storage each server occupies in the repository
+- File browser per backup with single-file download, without restoring the whole server; SHA-256 per file and a diff API that compares two backups
+- Restic password safety: a reminder until you confirm the password is stored elsewhere, a printable emergency sheet (never contains the password) and a second emergency key
+- Prometheus `/metrics` endpoint and a Grafana dashboard
+- Notifications (ntfy) for failed or abandoned backups, maintenance, offsite copy and trash
 - Retention via the Panel's own backup rotation (`backup_limit`)
 
 ## Screenshots
@@ -30,7 +36,7 @@ _Screenshots will follow._
 
 ## Quick start
 
-This is a high-level outline; see `gateway/README.md` and `extension/README.md` for all options.
+This is a high-level outline; see `gateway/README.md` and `extension/README.md` for all options. Once the extension is installed (step 4), its **Setup** page (Admin -> Setup) can do steps 1 to 3 for you: pre-check, egg import, gateway server with generated secrets, copy-ready `.env` and Wings snippets, and a self-test.
 
 1. **Create the gateway server.** Import `egg/egg-peb-gateway.json` as an egg (image `ghcr.io/fischlord/peb-gateway`) and create a server from it on a node of your choice. Set the egg variables: S3 access key and secret, bucket name, restic repository and password, and a `PEB_ADMIN_TOKEN` of at least 32 characters. Set the server's `backup_limit` to 0.
 2. **Point the Panel at the gateway.** In the Panel `.env`:
@@ -78,6 +84,7 @@ More detail in [docs/architecture.md](docs/architecture.md) and [docs/admin-api.
 - Wings stores the archive locally first, so it temporarily needs space the size of the server.
 - The S3 setting is panel-wide: one gateway serves all nodes.
 - The browser download button talks to the gateway directly, so it needs an externally reachable HTTPS address (not behind an SSO proxy).
+- A Docker or Wings restart during a backup aborts it. Wings does not retry, so that backup is missing (no data is lost, and a half-finished snapshot is never stored); the gateway sends a notification. Do not update Docker packages automatically (for example `apt-mark hold docker-ce docker-ce-cli containerd.io`), or run updates outside the backup schedules.
 - Wings only accepts restore downloads served as gzip and blocks private addresses unless allowlisted.
 - The restic password is the key to all backups. Keep a second safe copy.
 
@@ -91,12 +98,13 @@ The full list is in [docs/architecture.md](docs/architecture.md) and [gateway/RE
 
 ## Free and Pro
 
-This repository contains the complete Free edition: gateway, dashboard, file browser, maintenance, and Panel-based retention. A separate **Pro** extension (`peb-backups-pro`) adds advanced retention policies (keep daily/weekly/monthly with a preview). It is sold separately on BuiltByBit and is not part of this repository.
+This repository contains the complete Free edition: gateway, dashboard, file browser, maintenance, offsite copy (one secondary target), Prometheus metrics, trash, and Panel-based retention. A separate **Pro** extension (`peb-backups-pro`) adds policy-based retention (keep daily/weekly/monthly with a preview). It is sold separately on BuiltByBit and is not part of this repository.
 
 | | Free (this repository) | Pro |
 |---|---|---|
 | Gateway, S3 interface, deduplication, restore | yes | yes |
 | Dashboard, file browser, maintenance | yes | yes |
+| Offsite copy (1 secondary target), Prometheus metrics, trash | yes | yes |
 | Retention | Panel rotation (`backup_limit`) | policy-based (daily/weekly/monthly, per server, with preview) |
 
 ## Development

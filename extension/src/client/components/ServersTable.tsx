@@ -58,6 +58,18 @@ export default function ServersTable({ rows, warnHours, onOpen }: { rows: Server
             cellClassName: 'peb:whitespace-nowrap',
             cell: (r) => <Hint text={t('tip_col_added_server')}>{formatBytes(r.last_data_added, locale)}</Hint>,
         },
+        {
+            id: 'stored',
+            label: t('col_stored'),
+            sortValue: (r) => r.stored_bytes ?? -1,
+            cellClassName: 'peb:whitespace-nowrap',
+            cell: (r) =>
+                r.stored_bytes === null || r.stored_bytes === undefined ? (
+                    <Muted>–</Muted>
+                ) : (
+                    <Hint text={t('tip_col_stored_server')}>{formatBytes(r.stored_bytes, locale)}</Hint>
+                ),
+        },
         { id: 'count', label: t('col_backups'), sortValue: (r) => r.backup_count, cell: (r) => formatNumber(r.backup_count, locale) },
         {
             id: 'limit',

@@ -64,6 +64,21 @@ func (c *Client) RawStats(ctx context.Context) (RepoStats, error) {
 	return s, err
 }
 
+// ServerTag is the snapshot tag that assigns a snapshot to a Panel server.
+func ServerTag(serverUUID string) string { return "server:" + serverUUID }
+
+// RawStatsTag is RawStats limited to the snapshots with the given tag. Chunks
+// shared with other snapshots count in full, so sums over tags can exceed the repository size.
+func (c *Client) RawStatsTag(ctx context.Context, tag string) (RepoStats, error) {
+	var s RepoStats
+	out, err := c.output(ctx, "stats", "--mode", "raw-data", "--json", "--tag", tag)
+	if err != nil {
+		return s, err
+	}
+	err = json.Unmarshal(out, &s)
+	return s, err
+}
+
 var pruneTotalRe = regexp.MustCompile(`(?m)^total prune:\s+\d+ blobs / ([\d.]+) (B|KiB|MiB|GiB|TiB)\s*$`)
 
 // parsePruneFreed reads the "total prune" line of the text output.
@@ -153,4 +168,13 @@ func (g *Gated) RawStats(ctx context.Context) (RepoStats, error) {
 	}
 	defer g.Gate.Leave()
 	return g.Client.RawStats(ctx)
+}
+
+// RawStatsTag waits for the gate (bounded by ctx), then reads the stats of the tagged snapshots.
+func (g *Gated) RawStatsTag(ctx context.Context, tag string) (RepoStats, error) {
+	if err := g.Gate.Enter(ctx); err != nil {
+		return RepoStats{}, err
+	}
+	defer g.Gate.Leave()
+	return g.Client.RawStatsTag(ctx, tag)
 }

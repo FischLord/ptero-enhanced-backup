@@ -82,6 +82,31 @@ class GatewayClient
     }
 
     /**
+     * @param  array<string, mixed>  $body
+     * @return array<string, mixed>
+     *
+     * @throws GatewayException
+     */
+    public function put(string $path, array $body): array
+    {
+        return $this->decode($this->send('put', $path, $body, $this->request()));
+    }
+
+    /**
+     * DELETE; die Antwort darf leer sein (204).
+     *
+     * @return array<string, mixed>
+     *
+     * @throws GatewayException
+     */
+    public function delete(string $path): array
+    {
+        $response = $this->send('delete', $path, [], $this->request());
+
+        return trim($response->body()) === '' ? [] : $this->decode($response);
+    }
+
+    /**
      * Antwort ohne Puffer, fuer Einzeldatei-Downloads. Der Aufrufer liest den Body-Stream.
      *
      * @param  array<string, scalar|null>  $query
@@ -122,7 +147,12 @@ class GatewayClient
         $url = $this->config->apiBase().'/'.ltrim($path, '/');
 
         try {
-            $response = $method === 'post' ? $request->asJson()->post($url, $data) : $request->get($url, $data);
+            $response = match ($method) {
+                'post' => $request->asJson()->post($url, $data),
+                'put' => $request->asJson()->put($url, $data),
+                'delete' => $request->delete($url),
+                default => $request->get($url, $data),
+            };
         } catch (ConnectionException $e) {
             throw $this->connectionFailure($e->getMessage());
         } catch (Throwable $e) {

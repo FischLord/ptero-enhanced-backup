@@ -4,11 +4,15 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"ptero-enhanced-backup/gateway/internal/gate"
+	"ptero-enhanced-backup/gateway/internal/ingest"
+	"ptero-enhanced-backup/gateway/internal/s3auth"
 )
 
 func TestLocation(t *testing.T) {
@@ -62,4 +66,45 @@ func TestAcquireDumpRespectsGateAndSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
+}
+
+// countBody is an endless body that counts what the server reads from it.
+type countBody struct{ n int64 }
+
+func (c *countBody) Read(p []byte) (int, error) { c.n += int64(len(p)); return len(p), nil }
+func (c *countBody) Close() error               { return nil }
+
+// A request that fails authentication must not get the full part drain: only a
+// bounded read, then the connection is closed.
+func TestUnauthenticatedPartBodyIsDrainedBoundedAndClosed(t *testing.T) {
+	s := &Server{Bucket: "b", Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Verifier:     &s3auth.Verifier{Creds: s3auth.Credentials{AccessKey: "a", SecretKey: "s", Region: "us-east-1"}},
+		MaxPartBytes: 1 << 30}
+	body := &countBody{}
+	r := httptest.NewRequest("PUT", "http://gw.local/b/srv/x.tar.gz?partNumber=1&uploadId=u", body)
+	r.ContentLength = 1 << 30
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code < 400 || w.Code >= 500 {
+		t.Fatalf("status %d", w.Code)
+	}
+	if w.Header().Get("Connection") != "close" {
+		t.Fatalf("Connection header %q", w.Header().Get("Connection"))
+	}
+	if body.n > unauthDrainMax+64<<10 {
+		t.Fatalf("read %d bytes of an unauthenticated body", body.n)
+	}
+}
+
+// A failed lookup of the upload is answered 409 and must not fail the upload
+// (the nil Ingest would panic in Fail).
+func TestUploadPartLookupErrorDoesNotFailUpload(t *testing.T) {
+	s := &Server{Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		getUpload: func(string) (*ingest.Upload, error) { return nil, errors.New("database is locked") }}
+	r := httptest.NewRequest("PUT", "http://gw.local/b/srv/x.tar.gz?partNumber=1&uploadId=u", nil)
+	err := s.uploadPart(httptest.NewRecorder(), r, "srv/x.tar.gz", "u", "1", &s3auth.Result{})
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.Status != 409 {
+		t.Fatalf("got %v", err)
+	}
 }

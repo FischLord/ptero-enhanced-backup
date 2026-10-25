@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"ptero-enhanced-backup/gateway/internal/maintenance"
+	"ptero-enhanced-backup/gateway/internal/offsite"
 	"ptero-enhanced-backup/gateway/internal/store"
 )
 
@@ -349,6 +350,26 @@ func TestServers(t *testing.T) {
 	if s3["last_status"] != "failed" || s3["last_error"] != "ingest failed" || s3["backup_count"] != 0.0 || s3["last_success_at"] != nil ||
 		s3["last_backup_bytes"] != 0.0 || s3["last_data_added"] != 0.0 {
 		t.Fatalf("srv3: %v", s3)
+	}
+}
+
+func TestServersStoredBytes(t *testing.T) {
+	f := newFixture(t)
+	f.seed(t, "srv1", "b1", base.Add(-time.Hour), 1000, 400, 300, time.Second)
+	f.seed(t, "srv2", "b2", base.Add(-time.Hour), 1000, 400, 300, time.Second)
+	if err := f.st.SetServerStat(context.Background(), "srv1", 4096, base.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	items := decode(t, f.get(t, "/servers"), 200)["items"].([]any)
+	s1, s2 := items[0].(map[string]any), items[1].(map[string]any)
+	if s1["stored_bytes"] != 4096.0 || s1["stored_at"] != "2026-10-24T11:30:00Z" {
+		t.Fatalf("srv1: %v", s1)
+	}
+	if v, ok := s2["stored_bytes"]; !ok || v != nil {
+		t.Fatalf("srv2 stored_bytes must be present and null: %v", s2)
+	}
+	if v, ok := s2["stored_at"]; !ok || v != nil {
+		t.Fatalf("srv2 stored_at must be present and null: %v", s2)
 	}
 }
 
@@ -825,5 +846,116 @@ func TestSummaryTarget(t *testing.T) {
 	if tg["exact"] != false || tg["total_bytes"] != 1000.0 || tg["free_bytes"] != 700.0 || tg["peb_bytes"] != 300.0 ||
 		tg["other_bytes"] != 0.0 || tg["backups_remaining"] != nil || tg["avg_data_added"] != nil {
 		t.Fatalf("capacity fallback: %v", tg)
+	}
+}
+
+type fakeOffsite struct {
+	st   offsite.Status
+	busy bool
+	runs int
+
+	confirmed int
+}
+
+func (o *fakeOffsite) Status(context.Context) (offsite.Status, error) { return o.st, nil }
+func (o *fakeOffsite) ConfirmForget(context.Context) error            { o.confirmed++; return nil }
+func (o *fakeOffsite) TriggerCopy() (int64, error) {
+	if o.busy {
+		return 0, offsite.ErrBusy
+	}
+	o.runs++
+	return 77, nil
+}
+
+func TestSecondaryNotConfigured(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/status", "/summary"} {
+		sec := decode(t, f.get(t, path), 200)["secondary"].(map[string]any)
+		if sec["configured"] != false || sec["repo"] != nil || sec["state"] != "off" {
+			t.Fatalf("%s: %v", path, sec)
+		}
+	}
+	if rec := f.do(t, "POST", "/maintenance/run", `{"jobs":["copy"]}`, token); rec.Code != 400 {
+		t.Fatalf("copy without offsite: %d", rec.Code)
+	}
+}
+
+func TestSecondaryStatus(t *testing.T) {
+	f := newFixture(t)
+	lag, stored := int64(3), int64(5000)
+	o := &fakeOffsite{st: offsite.Status{
+		Repo:     "s3:https://AKIAKEY:topsecret@s3.example.org/bucket/peb",
+		LastCopy: &store.Job{Result: store.JobOK, FinishedAt: base.Add(-time.Hour)},
+		Lag:      &lag, LagSince: base.Add(-2 * time.Hour), StoredBytes: &stored, StoredAt: base.Add(-3 * time.Hour),
+		NextCopy: base.Add(5 * time.Minute), Pending: true,
+	}}
+	f.srv.Offsite = o
+	for _, path := range []string{"/status", "/summary"} {
+		rec := f.get(t, path)
+		if strings.Contains(rec.Body.String(), "topsecret") || strings.Contains(rec.Body.String(), "AKIAKEY") {
+			t.Fatalf("%s leaks credentials: %s", path, rec.Body)
+		}
+		sec := decode(t, rec, 200)["secondary"].(map[string]any)
+		if sec["configured"] != true || sec["repo"] != "s3:https://s3.example.org/bucket/peb" || sec["type"] != "s3" ||
+			sec["last_copy_result"] != "ok" || sec["lag_snapshots"] != 3.0 || sec["stored_bytes"] != 5000.0 ||
+			sec["state"] != "ok" || sec["last_copy_at"] != "2026-10-24T11:00:00Z" || sec["next_copy_at"] != "2026-10-24T12:05:00Z" {
+			t.Fatalf("%s: %v", path, sec)
+		}
+	}
+	o.st.LastError = "copy failed: token expired"
+	o.st.LastCopy.Result = store.JobFailed
+	sec := decode(t, f.get(t, "/status"), 200)["secondary"].(map[string]any)
+	if sec["state"] != "error" || sec["last_error"] != "copy failed: token expired" {
+		t.Fatalf("%v", sec)
+	}
+}
+
+func TestMaintenanceRunCopy(t *testing.T) {
+	f := newFixture(t)
+	o := &fakeOffsite{}
+	f.srv.Offsite = o
+	m := decode(t, f.do(t, "POST", "/maintenance/run", `{"jobs":["copy"]}`, token), 202)
+	if m["id"] != 77.0 || o.runs != 1 || len(f.maint.trigger) != 0 {
+		t.Fatalf("%v runs=%d", m, o.runs)
+	}
+	m = decode(t, f.do(t, "POST", "/maintenance/run", `{"jobs":["copy","stats"]}`, token), 202)
+	if len(m["job_ids"].([]any)) != 2 || len(f.maint.trigger) != 1 {
+		t.Fatalf("%v", m)
+	}
+	o.busy = true
+	decode(t, f.do(t, "POST", "/maintenance/run", `{"jobs":["copy"]}`, token), 409)
+}
+
+func TestStatusPruneSkipWarnings(t *testing.T) {
+	f := newFixture(t)
+	m := decode(t, f.get(t, "/status"), 200)["maintenance"].(map[string]any)
+	if w, ok := m["warnings"].([]any); !ok || len(w) != 0 || m["prune_skipped_consecutive"] != 0.0 {
+		t.Fatalf("clean: %v", m)
+	}
+	f.maint.status.PruneSkipped = 3
+	f.maint.status.Warnings = []string{"prune was skipped as busy 3 times in a row"}
+	m = decode(t, f.get(t, "/status"), 200)["maintenance"].(map[string]any)
+	if w := m["warnings"].([]any); len(w) != 1 || m["prune_skipped_consecutive"] != 3.0 {
+		t.Fatalf("warned: %v", m)
+	}
+}
+
+func TestOffsiteForgetConfirm(t *testing.T) {
+	f := newFixture(t)
+	if rec := f.do(t, "POST", "/offsite/forget-confirm", ``, token); rec.Code != 400 {
+		t.Fatalf("without offsite: %d", rec.Code)
+	}
+	o := &fakeOffsite{st: offsite.Status{Repo: "rclone:gdrive:peb", ForgetBlocked: true, LastError: "forget-secondary: too many"}}
+	f.srv.Offsite = o
+	if rec := f.do(t, "POST", "/offsite/forget-confirm", ``, ""); rec.Code != 401 {
+		t.Fatalf("without token: %d", rec.Code)
+	}
+	m := decode(t, f.do(t, "POST", "/offsite/forget-confirm", ``, token), 200)
+	if m["confirmed"] != true || o.confirmed != 1 {
+		t.Fatalf("%v %d", m, o.confirmed)
+	}
+	sec := decode(t, f.get(t, "/status"), 200)["secondary"].(map[string]any)
+	if sec["forget_blocked"] != true || sec["state"] != "error" {
+		t.Fatalf("%v", sec)
 	}
 }

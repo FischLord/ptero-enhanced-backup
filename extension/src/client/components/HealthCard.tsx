@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
 import { Badge, Card, ProgressBar } from '@pterodactyl/sdk';
 import { formatBytes, formatDateTime, formatNumber, formatPercent, formatRelative } from '../format';
-import { useT } from '../i18n';
+import { jobKey, useT } from '../i18n';
 import type { MaintenanceJob, Overview } from '../types';
 import { JobResultBadge, Muted } from './Common';
 
@@ -67,7 +67,7 @@ export default function HealthCard({ overview }: { overview: Overview }) {
                     <Row label={t('health_running')}>
                         <span className={'peb:flex peb:items-center peb:gap-2'}>
                             <JobResultBadge result={running.result} />
-                            <span>{t(`job_${running.type}`)}</span>
+                            <span>{t(jobKey(running.type))}</span>
                         </span>
                     </Row>
                 )}

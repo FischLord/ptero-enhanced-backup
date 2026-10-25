@@ -675,3 +675,43 @@ func TestOnDoneReportsFailureAndTimeout(t *testing.T) {
 		t.Fatal("no event")
 	}
 }
+
+func TestRecoverAndReapReportAbandoned(t *testing.T) {
+	be := &fakeBackend{}
+	m := newTestManager(t, be)
+	ctx := context.Background()
+	var mu sync.Mutex
+	var evs []AbandonedEvent
+	m.OnAbandoned = func(ev AbandonedEvent) { mu.Lock(); evs = append(evs, ev); mu.Unlock() }
+
+	// idle upload is reaped and reported once
+	m.IdleLimit = time.Millisecond
+	if _, err := m.Create(ctx, "srv/idle.tar.gz", "srv", "idle"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	m.Reap()
+	m.Reap()
+	mu.Lock()
+	if len(evs) != 1 || evs[0].ServerUUID != "srv" || evs[0].BackupUUID != "idle" || evs[0].Reason == "" {
+		t.Fatalf("reap events: %+v", evs)
+	}
+	evs = nil
+	mu.Unlock()
+
+	// a pending row left by a previous process is failed and reported once
+	if _, err := m.Store.CreateUpload(ctx, "old", "srv/old.tar.gz", "srv", "old", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(evs) != 1 || evs[0].BackupUUID != "old" {
+		t.Fatalf("recover events: %+v", evs)
+	}
+}

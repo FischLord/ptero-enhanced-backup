@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"ptero-enhanced-backup/gateway/internal/maintenance"
+	"ptero-enhanced-backup/gateway/internal/offsite"
 	"ptero-enhanced-backup/gateway/internal/restic"
 	"ptero-enhanced-backup/gateway/internal/store"
 )
@@ -39,6 +40,14 @@ type Maintenance interface {
 	Trigger(jobs []string) ([]int64, error)
 }
 
+// Offsite is the offsite copy (secondary repository). A nil Offsite means "not configured".
+type Offsite interface {
+	Status(ctx context.Context) (offsite.Status, error)
+	TriggerCopy() (int64, error)
+	// ConfirmForget releases a stopped forget step once.
+	ConfirmForget(ctx context.Context) error
+}
+
 // Dumps hands out restore slots shared with the S3 download path.
 type Dumps interface {
 	AcquireDump(ctx context.Context) (func(), error)
@@ -55,6 +64,8 @@ type Server struct {
 	Store      *store.Store
 	Restic     Restic
 	Maint      Maintenance
+	Offsite    Offsite
+	Keys       KeyManager // nil: the key endpoints answer 501
 	Dumps      Dumps
 	Ingest     Ingests
 	SpoolUsed  func() int64
@@ -66,15 +77,28 @@ type Server struct {
 	Now        func() time.Time // default time.Now
 	Loc        *time.Location   // day boundaries of the history, default time.Local
 	Started    time.Time
+	// Forgetter purges trashed snapshots on request; Notify gets the trash messages (may be nil).
+	Forgetter Forgetter
+	Notify    Notifier
+	// OrphanRetention: how long the backups of a server deleted in the panel stay in the trash.
+	OrphanRetention time.Duration
+	// ReconcileOff answers POST /servers/reconcile with skipped=disabled (PEB_RECONCILE=0).
+	ReconcileOff bool
 	// DownloadTimeout bounds a single-file download (default 2h).
 	DownloadTimeout time.Duration
 	ReachableTTL    time.Duration // default 60s
+	// MetricsToken, if set, is the only token accepted on /metrics; else Token is used.
+	MetricsToken string
 
 	once    sync.Once
 	mux     *http.ServeMux
 	reachMu sync.Mutex
 	reachAt time.Time
 	reachOK bool
+
+	metricsMu    sync.Mutex
+	metricsAt    time.Time
+	metricsCache *metricsData
 }
 
 func (s *Server) now() time.Time {
@@ -124,10 +148,18 @@ func (s *Server) routes() {
 	m.HandleFunc("GET "+Prefix+"/backups", s.backups)
 	m.HandleFunc("GET "+Prefix+"/backups/{uuid}/files", s.files)
 	m.HandleFunc("GET "+Prefix+"/backups/{uuid}/file", s.file)
+	m.HandleFunc("GET "+Prefix+"/backups/{uuid}/diff", s.diff)
 	m.HandleFunc("GET "+Prefix+"/history", s.history)
 	m.HandleFunc("GET "+Prefix+"/maintenance", s.maintenanceJobs)
 	m.HandleFunc("POST "+Prefix+"/maintenance/run", s.maintenanceRun)
+	m.HandleFunc("POST "+Prefix+"/offsite/forget-confirm", s.offsiteForgetConfirm)
+	m.HandleFunc("GET "+Prefix+"/settings/password-ack", s.getPasswordAck)
+	m.HandleFunc("PUT "+Prefix+"/settings/password-ack", s.putPasswordAck)
+	m.HandleFunc("GET "+Prefix+"/keys", s.listKeys)
+	m.HandleFunc("POST "+Prefix+"/keys", s.createKey)
+	m.HandleFunc("DELETE "+Prefix+"/keys/{id}", s.deleteKey)
 	s.mux = m
+	s.trashRoutes()
 }
 
 // ---- helpers ----
@@ -228,6 +260,55 @@ func repoInfo(repo string) (typ, loc string) {
 	return typ, scheme + rest
 }
 
+// offsiteBlock is the "secondary" block of status and summary. The repository
+// address is shown without credentials.
+func (s *Server) offsiteBlock(ctx context.Context) (map[string]any, error) {
+	out := map[string]any{
+		"configured": false, "repo": nil, "type": nil, "state": "off", "running": false, "last_copy_at": nil, "last_copy_result": nil,
+		"last_error": "", "forget_blocked": false, "lag_snapshots": nil, "lag_since": nil, "stored_bytes": nil, "stored_at": nil, "next_copy_at": nil,
+	}
+	if s.Offsite == nil {
+		return out, nil
+	}
+	st, err := s.Offsite.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	typ, loc := repoInfo(st.Repo)
+	repo := loc
+	if typ != "local" {
+		repo = typ + ":" + loc
+	}
+	out["configured"], out["repo"], out["type"] = true, repo, typ
+	out["last_error"] = st.LastError
+	out["forget_blocked"] = st.ForgetBlocked
+	out["running"] = st.Running != nil
+	if st.LastCopy != nil {
+		out["last_copy_at"] = tstr(st.LastCopy.FinishedAt)
+		out["last_copy_result"] = st.LastCopy.Result
+	}
+	if st.Lag != nil {
+		out["lag_snapshots"] = *st.Lag
+	}
+	out["lag_since"] = tstr(st.LagSince)
+	if st.StoredBytes != nil {
+		out["stored_bytes"] = *st.StoredBytes
+		out["stored_at"] = tstr(st.StoredAt)
+	}
+	out["next_copy_at"] = tstr(st.NextCopy)
+	switch {
+	case st.Running != nil:
+		out["state"] = "copying"
+	case st.LastError != "" || (st.LastCopy != nil && st.LastCopy.Result == store.JobFailed):
+		out["state"] = "error"
+	case st.LastCopy == nil:
+		out["state"] = "pending"
+	default:
+		out["state"] = "ok"
+	}
+	return out, nil
+}
+
 func (s *Server) reachable(ctx context.Context) (bool, time.Time) {
 	ttl := s.ReachableTTL
 	if ttl <= 0 {
@@ -256,7 +337,17 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	typ, loc := repoInfo(s.Repo)
 	ok, at := s.reachable(ctx)
 	running, queued := s.Ingest.Load()
+	sec, err := s.offsiteBlock(ctx)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	warnings := ms.Warnings
+	if warnings == nil {
+		warnings = []string{}
+	}
 	writeJSON(w, 200, map[string]any{
+		"secondary":      sec,
 		"version":        s.Version,
 		"uptime_seconds": int64(s.now().Sub(s.Started).Seconds()),
 		"repo":           map[string]any{"type": typ, "location": loc, "reachable": ok, "checked_at": tstr(at)},
@@ -264,11 +355,13 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"dumps":          map[string]any{"active": s.Dumps.ActiveDumps()},
 		"spool":          map[string]any{"used_bytes": s.SpoolUsed(), "limit_bytes": s.SpoolLimit},
 		"maintenance": map[string]any{
-			"prune_enabled": ms.PruneEnabled,
-			"next_window":   tstr(ms.NextWindow),
-			"last_prune":    jobOut(ms.LastPrune),
-			"last_check":    jobOut(ms.LastCheck),
-			"running_job":   jobOut(ms.Running),
+			"prune_enabled":             ms.PruneEnabled,
+			"next_window":               tstr(ms.NextWindow),
+			"last_prune":                jobOut(ms.LastPrune),
+			"last_check":                jobOut(ms.LastCheck),
+			"running_job":               jobOut(ms.Running),
+			"prune_skipped_consecutive": ms.PruneSkipped,
+			"warnings":                  warnings,
 		},
 	})
 }
@@ -324,6 +417,16 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out["target"] = target
+	tt, err := s.Store.TrashTotals(ctx)
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	out["trash"] = map[string]any{"count": tt.Count, "logical_bytes": tt.LogicalBytes, "next_purge_at": tstr(tt.NextPurge)}
+	if out["secondary"], err = s.offsiteBlock(ctx); err != nil {
+		s.internal(w, err)
+		return
+	}
 	writeJSON(w, 200, out)
 }
 
@@ -386,10 +489,19 @@ type serverJSON struct {
 	// Latest complete backup: uncompressed size and what it really added after dedup.
 	LastBackupBytes int64 `json:"last_backup_bytes"`
 	LastDataAdded   int64 `json:"last_data_added"`
+	// Space the server's snapshots occupy in the repository (compressed, deduplicated);
+	// null until measured.
+	StoredBytes *int64  `json:"stored_bytes"`
+	StoredAt    *string `json:"stored_at"`
 }
 
 func (s *Server) servers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.Store.ServerRows(r.Context())
+	if err != nil {
+		s.internal(w, err)
+		return
+	}
+	stats, err := s.Store.ServerStats(r.Context())
 	if err != nil {
 		s.internal(w, err)
 		return
@@ -420,6 +532,10 @@ func (s *Server) servers(w http.ResponseWriter, r *http.Request) {
 	for id, sj := range byUUID {
 		if sj.BackupCount > 0 {
 			sj.AvgDurationMS = totalDur[id] / sj.BackupCount
+		}
+		if st, ok := stats[id]; ok {
+			b, at := st.StoredBytes, st.MeasuredAt.UTC().Format(time.RFC3339)
+			sj.StoredBytes, sj.StoredAt = &b, &at
 		}
 		items = append(items, sj)
 	}
@@ -494,6 +610,19 @@ func (s *Server) maintenanceJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": items})
 }
 
+// offsiteForgetConfirm releases the stopped forget step of the offsite copy once.
+func (s *Server) offsiteForgetConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.Offsite == nil {
+		writeErr(w, 400, "bad_request", "needs a configured offsite copy (PEB_SECONDARY_REPO)")
+		return
+	}
+	if err := s.Offsite.ConfirmForget(r.Context()); err != nil {
+		s.internal(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"confirmed": true})
+}
+
 func (s *Server) maintenanceRun(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Jobs []string `json:"jobs"`
@@ -504,29 +633,63 @@ func (s *Server) maintenanceRun(w http.ResponseWriter, r *http.Request) {
 	}
 	want := map[string]bool{}
 	for _, j := range body.Jobs {
-		if j != maintenance.JobPrune && j != maintenance.JobCheck && j != maintenance.JobStats {
-			writeErr(w, 400, "bad_request", "jobs may contain prune, check and stats")
+		switch j {
+		case maintenance.JobPrune, maintenance.JobCheck, maintenance.JobStats, maintenance.JobTrashPurge:
+		case offsite.JobCopy:
+			if s.Offsite == nil {
+				writeErr(w, 400, "bad_request", "copy needs a configured offsite copy (PEB_SECONDARY_REPO)")
+				return
+			}
+		default:
+			writeErr(w, 400, "bad_request", "jobs may contain prune, check, stats, trash-purge and copy")
 			return
 		}
 		want[j] = true
 	}
 	var jobs []string
-	for _, j := range []string{maintenance.JobPrune, maintenance.JobCheck, maintenance.JobStats} { // fixed order
+	for _, j := range []string{maintenance.JobTrashPurge, maintenance.JobPrune, maintenance.JobCheck, maintenance.JobStats} { // fixed order
 		if want[j] {
 			jobs = append(jobs, j)
 		}
 	}
-	if len(jobs) == 0 {
+	if len(jobs) == 0 && !want[offsite.JobCopy] {
 		writeErr(w, 400, "bad_request", "jobs must not be empty")
 		return
 	}
-	ids, err := s.Maint.Trigger(jobs)
-	switch {
-	case errors.Is(err, maintenance.ErrBusy):
-		writeErr(w, 409, "busy", "a maintenance run is already in progress")
-	case err != nil:
-		s.internal(w, err)
-	default:
-		writeJSON(w, 202, map[string]any{"id": ids[0], "job_ids": ids})
+	// Maintenance first: if it is busy nothing was started, so the 409 is true.
+	var ids []int64
+	if len(jobs) > 0 {
+		var err error
+		ids, err = s.Maint.Trigger(jobs)
+		switch {
+		case errors.Is(err, maintenance.ErrBusy):
+			writeErr(w, 409, "busy", "a maintenance run is already in progress")
+			return
+		case err != nil:
+			s.internal(w, err)
+			return
+		}
 	}
+	if want[offsite.JobCopy] {
+		id, err := s.Offsite.TriggerCopy()
+		switch {
+		case errors.Is(err, offsite.ErrBusy):
+			if len(ids) > 0 { // the maintenance jobs did start
+				writeJSON(w, 202, map[string]any{"id": ids[0], "job_ids": ids, "copy_skipped": "busy"})
+				return
+			}
+			writeErr(w, 409, "busy", "an offsite copy run is already in progress")
+			return
+		case err != nil:
+			if len(ids) > 0 {
+				s.Log.Error("starting the offsite copy failed", "err", err)
+				writeJSON(w, 202, map[string]any{"id": ids[0], "job_ids": ids, "copy_skipped": "error"})
+				return
+			}
+			s.internal(w, err)
+			return
+		}
+		ids = append(ids, id)
+	}
+	writeJSON(w, 202, map[string]any{"id": ids[0], "job_ids": ids})
 }

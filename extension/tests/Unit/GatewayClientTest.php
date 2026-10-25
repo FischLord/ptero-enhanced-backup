@@ -43,6 +43,28 @@ test('posts JSON bodies', function () {
     $http->assertSent(fn (Request $r) => $r->method() === 'POST' && $r->data() === ['jobs' => ['check']]);
 });
 
+test('puts JSON bodies and accepts an empty answer to DELETE', function () {
+    $http = new Factory;
+    $http->fake([
+        '*/settings/password-ack' => Factory::response(['acknowledged' => true]),
+        '*/keys/*' => Factory::response('', 204),
+    ]);
+
+    expect(peb_client($http)->put('settings/password-ack', ['acknowledged' => true, 'by' => 'root']))->toBe(['acknowledged' => true]);
+    expect(peb_client($http)->delete('keys/'.str_repeat('a', 64)))->toBe([]);
+
+    $http->assertSent(fn (Request $r) => $r->method() === 'PUT' && $r->data() === ['acknowledged' => true, 'by' => 'root']);
+    $http->assertSent(fn (Request $r) => $r->method() === 'DELETE' && str_ends_with($r->url(), '/admin/v1/keys/'.str_repeat('a', 64)));
+});
+
+test('maps a 409 on DELETE (key in use) to a GatewayException with the gateway code', function () {
+    $http = new Factory;
+    $http->fake(['*' => Factory::response(['error' => 'current_key', 'message' => 'the key in use cannot be removed'], 409)]);
+    $e = peb_error(fn () => peb_client($http)->delete('keys/'.str_repeat('a', 64)));
+
+    expect($e->errorCode)->toBe('current_key')->and($e->status)->toBe(409);
+});
+
 test('reports a missing configuration without calling the gateway', function () {
     $http = new Factory;
     $http->fake();

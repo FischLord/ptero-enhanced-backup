@@ -21,8 +21,9 @@ class MaintenanceController
     {
         $data = $request->validate([
             'confirm' => ['required', 'accepted'],
-            'jobs' => ['required', 'array', 'min:1', 'max:3'],
-            'jobs.*' => ['string', 'in:prune,check,stats', 'distinct'],
+            'jobs' => ['required', 'array', 'min:1', 'max:4'],
+            // `copy` startet die Offsite-Kopie (das Gateway lehnt es ohne Zweitziel mit 400 ab).
+            'jobs.*' => ['string', 'in:prune,check,stats,trash-purge,copy', 'distinct'],
         ]);
 
         $result = $gateway->post('maintenance/run', ['jobs' => array_values($data['jobs'])]);

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,10 +17,18 @@ import (
 	"ptero-enhanced-backup/gateway/internal/store"
 )
 
+// msgSkippedBusy is the message of a job that found the repository busy.
+const msgSkippedBusy = "skipped: busy"
+
+// stateSkipWarned remembers that the "prune keeps being skipped" warning was sent.
+const stateSkipWarned = "prune_skip_warned"
+
 const (
 	JobPrune = "prune"
 	JobCheck = "check"
 	JobStats = "stats"
+	// JobTrashPurge forgets the trashed backups whose time has come (before the prune, so it frees the space).
+	JobTrashPurge = "trash-purge"
 )
 
 var (
@@ -35,6 +44,10 @@ type Backend interface {
 	Prune(ctx context.Context, maxUnused string) (restic.PruneResult, error)
 	Check(ctx context.Context, readDataSubset string) error
 	RawStats(ctx context.Context) (restic.RepoStats, error)
+	// RawStatsTag is RawStats limited to the snapshots with the tag.
+	RawStatsTag(ctx context.Context, tag string) (restic.RepoStats, error)
+	// ForgetRaw forgets a snapshot without waiting for the gate (maintenance holds it).
+	ForgetRaw(ctx context.Context, snapshotID string) error
 }
 
 // Gate stops new restic work and waits for the running work (see package gate).
@@ -57,7 +70,13 @@ type Config struct {
 	BusyWait       time.Duration // how long to wait for running work before skipping (default 15m)
 	JobTimeout     time.Duration // deadline for each job once it runs; restic is killed after it (default 3h)
 	MaxUnused      string        // restic prune --max-unused (default 5%)
-	StatsMinGap    time.Duration // minimum gap between stats refreshes after backups (default 10m)
+	StatsQuiet     time.Duration // stats refresh after backups this long after the last backup (default 2m)
+	StatsMaxWait   time.Duration // ... but at most this long after the first unmeasured backup (default 10m)
+	// PruneSkipWarn: warn (once) after this many prune jobs in a row were skipped as busy; 0 = never.
+	PruneSkipWarn int
+	// TrashWarnBytes: before the window ends, warn (ntfy) about trashed backups that
+	// become due within the next 24 h if they add up to at least this many logical bytes; 0 = off.
+	TrashWarnBytes int64
 }
 
 type Service struct {
@@ -73,6 +92,9 @@ type Service struct {
 	TargetSpace func() (total, free int64, err error)
 	// BaseCtx is the parent of manually triggered runs (default Background).
 	BaseCtx context.Context
+	// AfterWindow, if set, runs in the background after each scheduled window
+	// (the offsite copy's nightly run).
+	AfterWindow func(ctx context.Context)
 
 	// Now and Sleep are replaced in tests.
 	Now   func() time.Time
@@ -82,7 +104,13 @@ type Service struct {
 	wg      sync.WaitGroup
 	mu      sync.Mutex
 	current *store.Job
-	lastRef time.Time
+
+	statsMu      sync.Mutex
+	statsTimer   *time.Timer
+	statsClosed  bool
+	statsRunning bool
+	pendingSince time.Time       // first backup not measured yet; zero = nothing pending
+	pendingSrv   map[string]bool // servers to measure with the next refresh
 }
 
 func (s *Service) now() time.Time {
@@ -142,12 +170,19 @@ func (s *Service) Run(ctx context.Context) {
 			continue
 		}
 		s.execute(ctx, jobs, ids)
+		if s.AfterWindow != nil && ctx.Err() == nil {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.AfterWindow(ctx)
+			}()
+		}
 	}
 }
 
 // scheduledJobs picks what the daily window does.
 func (s *Service) scheduledJobs(ctx context.Context) []string {
-	var jobs []string
+	jobs := []string{JobTrashPurge}
 	if s.Cfg.PruneEnabled {
 		jobs = append(jobs, JobPrune)
 	}
@@ -231,8 +266,41 @@ func (s *Service) execute(ctx context.Context, jobs []string, ids []int64) {
 		_ = s.Store.FinishJob(bg, id, o.result, o.msg, o.freed, s.now())
 		s.setCurrent(nil)
 		s.Log.Info("maintenance job", "id", id, "type", typ, "result", o.result, "msg", o.msg)
+		if typ == JobPrune {
+			s.pruneSkipWarning(o)
+		}
 		if o.result == store.JobFailed && s.Notify != nil {
 			s.Notify.Send("PEB Wartung fehlgeschlagen", fmt.Sprintf("Wartungsjob %q ist fehlgeschlagen. Details im Gateway-Log.", typ))
+		}
+	}
+}
+
+// pruneSkipWarning sends one notification when the prune was skipped as busy
+// PruneSkipWarn times in a row. A successful prune re-arms it.
+func (s *Service) pruneSkipWarning(o outcome) {
+	if s.Cfg.PruneSkipWarn <= 0 {
+		return
+	}
+	ctx := context.Background()
+	switch {
+	case o.result == store.JobOK:
+		if err := s.Store.SetState(ctx, stateSkipWarned, ""); err != nil {
+			s.Log.Warn("store prune warning state failed", "err", err)
+		}
+	case o.result == store.JobSkipped && o.msg == msgSkippedBusy:
+		n, err := s.Store.ConsecutiveSkipped(ctx, JobPrune, msgSkippedBusy)
+		if err != nil || n < s.Cfg.PruneSkipWarn {
+			return
+		}
+		if v, _ := s.Store.State(ctx, stateSkipWarned); v != "" {
+			return
+		}
+		if err := s.Store.SetState(ctx, stateSkipWarned, "1"); err != nil {
+			s.Log.Warn("store prune warning state failed", "err", err)
+		}
+		s.Log.Warn("prune keeps being skipped because the repository is busy", "times", n)
+		if s.Notify != nil {
+			s.Notify.Send("PEB Prune wird uebersprungen", fmt.Sprintf("Der Prune des Hauptrepos wurde %d Mal in Folge uebersprungen, weil das Repository belegt war (lange Backups, Restores oder Offsite-Kopie). Ohne Prune wird kein Speicher freigegeben.", n))
 		}
 	}
 }
@@ -275,6 +343,8 @@ func (s *Service) runJob(ctx context.Context, typ string) outcome {
 			o.msg = fmt.Sprintf("prune finished, %d bytes freed", res.BytesFreed)
 		}
 		return o
+	case JobTrashPurge:
+		return s.purgeTrash(ctx)
 	case JobCheck:
 		err := s.exclusive(ctx, func() error {
 			if err := s.Backend.Unlock(ctx); err != nil {
@@ -300,6 +370,93 @@ func (s *Service) runJob(ctx context.Context, typ string) outcome {
 	return outcome{result: store.JobFailed, msg: "unknown job type"}
 }
 
+// purgeTrash forgets the trashed backups that are due. Only the snapshot is
+// forgotten; the following prune frees the space. A snapshot that fails stays
+// in the trash and is tried again the next night.
+func (s *Service) purgeTrash(ctx context.Context) outcome {
+	due, err := s.Store.DueTrash(ctx, s.now())
+	if err != nil {
+		return s.failureOutcome(JobTrashPurge, err)
+	}
+	if len(due) == 0 {
+		s.warnTrashSoon(ctx)
+		return outcome{result: store.JobOK, msg: "nothing to purge"}
+	}
+	var done, failed int
+	var bytes int64
+	err = s.exclusive(ctx, func() error {
+		if err := s.Backend.Unlock(ctx); err != nil {
+			s.Log.Warn("restic unlock failed", "err", err)
+		}
+		// Waiting for the repository can take long and an admin may restore meanwhile:
+		// every item is claimed again (trashed -> purging, only if still due) before its snapshot goes.
+		now := s.now()
+		for _, it := range due {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err := s.Store.BeginPurge(ctx, it.ID, &now); err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					continue // restored, purged by hand or no longer due
+				}
+				return err
+			}
+			if it.SnapshotID != "" {
+				if err := s.Backend.ForgetRaw(ctx, it.SnapshotID); err != nil {
+					s.Log.Error("trash purge: forget failed", "backup", it.BackupUUID, "err", err)
+					if aerr := s.Store.AbortPurge(context.Background(), it.ID); aerr != nil {
+						s.Log.Error("trash purge: could not put the backup back", "backup", it.BackupUUID, "err", aerr)
+					}
+					failed++
+					continue
+				}
+			}
+			if err := s.Store.FinishPurge(context.Background(), it.ID); err != nil {
+				return err
+			}
+			done++
+			bytes += it.UncompressedBytes
+		}
+		return nil
+	})
+	if o, handled := s.failure(JobTrashPurge, err); handled {
+		return o
+	}
+	s.warnTrashSoon(ctx)
+	if failed > 0 {
+		return outcome{result: store.JobFailed, msg: fmt.Sprintf("%d purged, %d failed, see gateway log", done, failed)}
+	}
+	return outcome{result: store.JobOK, msg: fmt.Sprintf("%d backups purged (%d bytes of original data)", done, bytes)}
+}
+
+// warnTrashSoon sends one ntfy message about the trash that empties in the next window.
+func (s *Service) warnTrashSoon(ctx context.Context) {
+	if s.Cfg.TrashWarnBytes <= 0 || s.Notify == nil {
+		return
+	}
+	now := s.now()
+	items, err := s.Store.TrashSoon(ctx, now, s.NextWindow().Add(time.Minute))
+	if err != nil {
+		s.Log.Warn("trash warning failed", "err", err)
+		return
+	}
+	var sum int64
+	for _, it := range items {
+		sum += it.UncompressedBytes
+	}
+	if len(items) == 0 || sum < s.Cfg.TrashWarnBytes {
+		return
+	}
+	s.Notify.Send("PEB Papierkorb wird geleert", fmt.Sprintf(
+		"Beim naechsten Wartungsfenster werden %d Backups (%.1f GB Originaldaten) endgueltig geloescht. Wiederherstellen geht bis dahin im Dashboard unter Papierkorb.",
+		len(items), float64(sum)/(1<<30)))
+}
+
+func (s *Service) failureOutcome(typ string, err error) outcome {
+	o, _ := s.failure(typ, err)
+	return o
+}
+
 // failure turns an error into a job outcome. Messages stay generic (restic's
 // error text may contain paths); the detail goes to the log.
 func (s *Service) failure(typ string, err error) (outcome, bool) {
@@ -307,7 +464,7 @@ func (s *Service) failure(typ string, err error) (outcome, bool) {
 	case err == nil:
 		return outcome{}, false
 	case errors.Is(err, errRepoBusy):
-		return outcome{result: store.JobSkipped, msg: "skipped: busy"}, true
+		return outcome{result: store.JobSkipped, msg: msgSkippedBusy}, true
 	}
 	s.Log.Error("maintenance job failed", "type", typ, "err", err)
 	return outcome{result: store.JobFailed, msg: typ + " failed, see gateway log"}, true
@@ -332,8 +489,44 @@ func (s *Service) exclusive(ctx context.Context, fn func() error) error {
 	return fn()
 }
 
-// RecordStats reads the repository size and stores a snapshot.
+// RecordStats is the full statistics run (nightly and manual): the repository
+// size, then the space of every server's snapshots. A failing server never
+// fails the run.
 func (s *Service) RecordStats(ctx context.Context) (store.RepoStat, error) {
+	st, err := s.RecordRepoStats(ctx)
+	if err != nil {
+		return st, err
+	}
+	s.recordServerStats(ctx, nil, true)
+	return st, nil
+}
+
+// RecordStartupStats takes the first repository snapshot and measures only the
+// servers that have no value yet.
+func (s *Service) RecordStartupStats(ctx context.Context) error {
+	if _, err := s.RecordRepoStats(ctx); err != nil {
+		return err
+	}
+	have, err := s.Store.ServerStats(ctx)
+	if err != nil {
+		return err
+	}
+	servers, err := s.Store.ServersWithSnapshots(ctx)
+	if err != nil {
+		return err
+	}
+	var missing []string
+	for _, u := range servers {
+		if _, ok := have[u]; !ok {
+			missing = append(missing, u)
+		}
+	}
+	s.recordServerStats(ctx, missing, false)
+	return nil
+}
+
+// RecordRepoStats reads the repository size and stores a snapshot.
+func (s *Service) RecordRepoStats(ctx context.Context) (store.RepoStat, error) {
 	rs, err := s.Backend.RawStats(ctx)
 	if err != nil {
 		return store.RepoStat{}, err
@@ -356,34 +549,149 @@ func (s *Service) RecordStats(ctx context.Context) (store.RepoStat, error) {
 			s.Log.Warn("measure backup target space failed", "err", err)
 		}
 	}
-	return st, s.Store.InsertRepoStat(ctx, st)
+	if err := s.Store.InsertRepoStat(ctx, st); err != nil {
+		return st, err
+	}
+	return st, nil
 }
 
-// BackupDone refreshes the repository stats after a completed backup, at most
-// every StatsMinGap and never while a maintenance run is active.
-func (s *Service) BackupDone() {
-	gap := s.Cfg.StatsMinGap
-	if gap <= 0 {
-		gap = 10 * time.Minute
+// serverStatTimeout bounds one per-server restic call.
+const serverStatTimeout = 15 * time.Minute
+
+// recordServerStats measures the space of the given servers' snapshots (all
+// servers if all is set), one restic call after the other (each waits for the
+// gate). A failed call is logged and keeps the old value.
+func (s *Service) recordServerStats(ctx context.Context, only []string, all bool) {
+	servers := only
+	if all {
+		var err error
+		servers, err = s.Store.ServersWithSnapshots(ctx)
+		if err != nil {
+			s.Log.Warn("list servers for stats failed", "err", err)
+			return
+		}
+		if err := s.Store.DeleteServerStatsExcept(ctx, servers); err != nil {
+			s.Log.Warn("clean up server stats failed", "err", err)
+		}
 	}
-	s.mu.Lock()
-	if s.busy.Load() || s.now().Sub(s.lastRef) < gap {
-		s.mu.Unlock()
+	for _, uuid := range servers {
+		if ctx.Err() != nil {
+			return
+		}
+		cctx, cancel := context.WithTimeout(ctx, serverStatTimeout)
+		rs, err := s.Backend.RawStatsTag(cctx, restic.ServerTag(uuid))
+		cancel()
+		if err != nil {
+			s.Log.Warn("server stats failed, keeping old value", "server", uuid, "err", err)
+			continue
+		}
+		if err := s.Store.SetServerStat(ctx, uuid, rs.TotalSize, s.now()); err != nil {
+			s.Log.Warn("store server stats failed", "server", uuid, "err", err)
+		}
+	}
+}
+
+// BackupDone notes a completed backup of serverUUID. The statistics (repository
+// size, then that server's space) are refreshed once the backups stop coming:
+// StatsQuiet after the last one, but at most StatsMaxWait after the first one
+// that is still unmeasured. A series of backups therefore ends in one
+// refresh with the final values, not in one measurement at the first backup.
+// Each server is measured once per refresh, never per backup.
+func (s *Service) BackupDone(serverUUID string) {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	if s.statsClosed {
 		return
 	}
-	s.lastRef = s.now()
-	s.mu.Unlock()
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		ctx := s.BaseCtx
-		if ctx == nil {
-			ctx = context.Background()
+	if s.pendingSince.IsZero() {
+		s.pendingSince = s.now()
+	}
+	if serverUUID != "" {
+		if s.pendingSrv == nil {
+			s.pendingSrv = map[string]bool{}
 		}
-		if _, err := s.RecordStats(ctx); err != nil {
-			s.Log.Warn("repo stats refresh failed", "err", err)
-		}
+		s.pendingSrv[serverUUID] = true
+	}
+	s.armStats(s.statsQuiet())
+}
+
+func (s *Service) statsQuiet() time.Duration {
+	if s.Cfg.StatsQuiet > 0 {
+		return s.Cfg.StatsQuiet
+	}
+	return 2 * time.Minute
+}
+
+func (s *Service) statsMaxWait() time.Duration {
+	if s.Cfg.StatsMaxWait > 0 {
+		return s.Cfg.StatsMaxWait
+	}
+	return 10 * time.Minute
+}
+
+// armStats (re)starts the timer; statsMu must be held. The delay is cut so the
+// refresh never lies more than StatsMaxWait after the oldest pending backup.
+func (s *Service) armStats(d time.Duration) {
+	if left := s.pendingSince.Add(s.statsMaxWait()).Sub(s.now()); left < d {
+		d = max(left, 0)
+	}
+	if s.statsTimer == nil {
+		s.statsTimer = time.AfterFunc(d, s.fireStats)
+	} else {
+		s.statsTimer.Reset(d)
+	}
+}
+
+// fireStats runs the pending refresh. While a maintenance run is active or an
+// earlier refresh is still running it tries again after the quiet period (the
+// nightly run measures everything anyway).
+func (s *Service) fireStats() {
+	s.statsMu.Lock()
+	if s.statsClosed || s.pendingSince.IsZero() {
+		s.statsMu.Unlock()
+		return
+	}
+	if s.busy.Load() || s.statsRunning {
+		s.armStats(s.statsQuiet())
+		s.statsMu.Unlock()
+		return
+	}
+	servers := make([]string, 0, len(s.pendingSrv))
+	for u := range s.pendingSrv {
+		servers = append(servers, u)
+	}
+	sort.Strings(servers)
+	s.pendingSrv, s.pendingSince = nil, time.Time{}
+	s.statsRunning = true
+	s.wg.Add(1) // under the lock: Close cannot slip in between
+	s.statsMu.Unlock()
+	defer s.wg.Done()
+	defer func() {
+		s.statsMu.Lock()
+		s.statsRunning = false
+		s.statsMu.Unlock()
 	}()
+	ctx := s.BaseCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if _, err := s.RecordRepoStats(ctx); err != nil {
+		s.Log.Warn("repo stats refresh failed", "err", err)
+	}
+	s.recordServerStats(ctx, servers, false)
+}
+
+// Close stops the pending statistics refresh; call it before Wait on shutdown.
+func (s *Service) Close() {
+	s.statsMu.Lock()
+	s.statsClosed = true
+	if s.statsTimer != nil {
+		s.statsTimer.Stop()
+	}
+	s.statsMu.Unlock()
 }
 
 // Status is the maintenance part of the admin status.
@@ -393,6 +701,10 @@ type Status struct {
 	LastPrune    *store.Job // nil if never ran
 	LastCheck    *store.Job
 	Running      *store.Job // nil if idle
+	// PruneSkipped counts the prune jobs in a row that were skipped as busy.
+	PruneSkipped int
+	// Warnings are short texts for things that need attention (empty = none).
+	Warnings []string
 }
 
 func (s *Service) Status(ctx context.Context) (Status, error) {
@@ -404,6 +716,14 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 		}
 		if err == nil {
 			*dst = j
+		}
+	}
+	if n, err := s.Store.ConsecutiveSkipped(ctx, JobPrune, msgSkippedBusy); err != nil {
+		return st, err
+	} else {
+		st.PruneSkipped = n
+		if w := s.Cfg.PruneSkipWarn; w > 0 && n >= w {
+			st.Warnings = append(st.Warnings, fmt.Sprintf("prune was skipped as busy %d times in a row", n))
 		}
 	}
 	s.mu.Lock()

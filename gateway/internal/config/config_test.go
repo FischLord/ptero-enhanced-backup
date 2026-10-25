@@ -85,3 +85,74 @@ func TestLoadMaintenanceDefaultsAndOverrides(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadSecondary(t *testing.T) {
+	base := map[string]string{"PEB_ACCESS_KEY": "a", "PEB_SECRET_KEY": "s", "PEB_BUCKET": "b", "RESTIC_PASSWORD": "p"}
+	c, err := Load(env(base))
+	if err != nil || c.SecondaryEnabled() || c.SecondaryDelay.Minutes() != 5 || c.SecondaryTimeout.Hours() != 6 {
+		t.Fatalf("defaults: %v %+v", err, c)
+	}
+	base["PEB_SECONDARY_REPO"] = "rclone:gdrive:peb"
+	base["PEB_SECONDARY_DELAY"] = "90s"
+	base["RCLONE_CONFIG"] = "/home/container/rclone.conf"
+	c, err = Load(env(base))
+	if err != nil || !c.SecondaryEnabled() || c.SecondaryDelay.Seconds() != 90 || c.RcloneConfig != "/home/container/rclone.conf" || c.SecondaryPass != "" {
+		t.Fatalf("%v %+v", err, c)
+	}
+	for k, v := range map[string]string{"PEB_SECONDARY_DELAY": "soon", "PEB_SECONDARY_TIMEOUT": "0", "PEB_SECONDARY_REPO": "/data/repo"} {
+		bad := map[string]string{"PEB_ACCESS_KEY": "a", "PEB_SECRET_KEY": "s", "PEB_BUCKET": "b", "RESTIC_PASSWORD": "p",
+			"PEB_SECONDARY_REPO": "rclone:x:y", "RESTIC_REPOSITORY": "/data/repo"}
+		bad[k] = v
+		if _, err := Load(env(bad)); err == nil {
+			t.Fatalf("%s=%s accepted", k, v)
+		}
+	}
+	if _, err := Load(env(map[string]string{"PEB_ACCESS_KEY": "a", "PEB_SECRET_KEY": "s", "PEB_BUCKET": "b", "RESTIC_PASSWORD": "p", "PEB_SECONDARY_PASSWORD": "x"})); err == nil {
+		t.Fatal("password without repo accepted")
+	}
+}
+
+func TestSpoolWaitTimeout(t *testing.T) {
+	base := map[string]string{"PEB_ACCESS_KEY": "a", "PEB_SECRET_KEY": "s", "PEB_BUCKET": "b", "RESTIC_PASSWORD": "p"}
+	c, err := Load(env(base))
+	if err != nil || c.SpoolWaitTimeout.Minutes() != 60 {
+		t.Fatalf("default: %v %v", err, c.SpoolWaitTimeout)
+	}
+	base["PEB_SPOOL_WAIT_TIMEOUT"] = "90m"
+	if c, err = Load(env(base)); err != nil || c.SpoolWaitTimeout.Minutes() != 90 {
+		t.Fatalf("90m: %v %v", err, c.SpoolWaitTimeout)
+	}
+	base["PEB_SPOOL_WAIT_TIMEOUT"] = "0"
+	if c, err = Load(env(base)); err != nil || c.SpoolWaitTimeout >= 0 {
+		t.Fatalf("0 must mean no waiting: %v %v", err, c.SpoolWaitTimeout)
+	}
+	// Wings gives an UploadPart request 2h in total; waiting longer cannot work.
+	base["PEB_SPOOL_WAIT_TIMEOUT"] = "3h"
+	if _, err = Load(env(base)); err == nil || !strings.Contains(err.Error(), "PEB_SPOOL_WAIT_TIMEOUT") {
+		t.Fatalf("3h accepted: %v", err)
+	}
+}
+
+func TestLoadMetricsToken(t *testing.T) {
+	long := strings.Repeat("m", 32)
+	admin := strings.Repeat("a", 32)
+	base := func(extra map[string]string) func(string) string {
+		m := map[string]string{"PEB_ACCESS_KEY": "a", "PEB_SECRET_KEY": strings.Repeat("s", 32), "PEB_BUCKET": "b", "RESTIC_PASSWORD": "p"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return env(m)
+	}
+	if _, err := Load(base(map[string]string{"PEB_METRICS_TOKEN": long, "PEB_ADMIN_TOKEN": admin})); err != nil {
+		t.Fatal(err)
+	}
+	for name, extra := range map[string]map[string]string{
+		"short":  {"PEB_METRICS_TOKEN": "short"},
+		"admin":  {"PEB_METRICS_TOKEN": admin, "PEB_ADMIN_TOKEN": admin},
+		"secret": {"PEB_METRICS_TOKEN": strings.Repeat("s", 32)},
+	} {
+		if _, err := Load(base(extra)); err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+}

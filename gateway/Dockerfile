@@ -4,7 +4,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/peb-gateway ./cmd/peb-gateway
+# Optional release version (empty keeps the default from main.go).
+ARG VERSION=
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w ${VERSION:+-X main.version=$VERSION}" -o /out/peb-gateway ./cmd/peb-gateway
 
 FROM debian:trixie-slim
 RUN apt-get update \

@@ -28,6 +28,10 @@ type fakeBackend struct {
 	started   chan struct{}
 	freed     int64
 	statsSize int64
+	tagSize   map[string]int64 // RawStatsTag result per tag
+	tagErr    map[string]error
+	forgetErr map[string]error // ForgetRaw result per snapshot
+	onUnlock  func()           // runs inside Unlock (the purge waited for the repository)
 }
 
 func (f *fakeBackend) record(c string) { f.mu.Lock(); f.calls = append(f.calls, c); f.mu.Unlock() }
@@ -38,7 +42,13 @@ func (f *fakeBackend) list() []string {
 	return append([]string(nil), f.calls...)
 }
 
-func (f *fakeBackend) Unlock(ctx context.Context) error { f.record("unlock"); return nil }
+func (f *fakeBackend) Unlock(ctx context.Context) error {
+	f.record("unlock")
+	if f.onUnlock != nil {
+		f.onUnlock()
+	}
+	return nil
+}
 func (f *fakeBackend) Prune(ctx context.Context, maxUnused string) (restic.PruneResult, error) {
 	f.record("prune " + maxUnused)
 	f.mu.Lock()
@@ -56,6 +66,12 @@ func (f *fakeBackend) Prune(ctx context.Context, maxUnused string) (restic.Prune
 	}
 	return restic.PruneResult{BytesFreed: f.freed}, f.pruneErr
 }
+func (f *fakeBackend) ForgetRaw(ctx context.Context, id string) error {
+	f.record("forget " + id)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.forgetErr[id]
+}
 func (f *fakeBackend) Check(ctx context.Context, subset string) error {
 	f.record("check " + subset)
 	return nil
@@ -63,6 +79,16 @@ func (f *fakeBackend) Check(ctx context.Context, subset string) error {
 func (f *fakeBackend) RawStats(ctx context.Context) (restic.RepoStats, error) {
 	f.record("stats")
 	return restic.RepoStats{TotalSize: f.statsSize, TotalUncompressedSize: 2 * f.statsSize, SnapshotsCount: 3, CompressionRatio: 2}, nil
+}
+
+func (f *fakeBackend) RawStatsTag(ctx context.Context, tag string) (restic.RepoStats, error) {
+	f.record("stats " + tag)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.tagErr[tag]; err != nil {
+		return restic.RepoStats{}, err
+	}
+	return restic.RepoStats{TotalSize: f.tagSize[tag]}, nil
 }
 
 type fakeNotify struct {
@@ -158,7 +184,7 @@ func TestSchedulerRunsEveryDay(t *testing.T) {
 		got = append(got, j.Type)
 	}
 	// Day 1: first check ever is due; day 2: not yet (interval is a week).
-	if strings.Join(got, ",") != "prune,check,stats,prune,stats" {
+	if strings.Join(got, ",") != "trash-purge,prune,check,stats,trash-purge,prune,stats" {
 		t.Fatalf("jobs: %v", got)
 	}
 	if st, err := f.st.LatestRepoStat(context.Background()); err != nil || st.TotalSize != 1000 || st.SnapshotsCount != 3 {
@@ -174,7 +200,7 @@ func TestPruneDisabledAndCheckSubset(t *testing.T) {
 	f.svc.Cfg.PruneEnabled = false
 	f.svc.Cfg.ReadDataSubset = "5%"
 	jobs := f.svc.scheduledJobs(context.Background())
-	if strings.Join(jobs, ",") != "check,stats" {
+	if strings.Join(jobs, ",") != "trash-purge,check,stats" {
 		t.Fatalf("jobs: %v", jobs)
 	}
 	ids, err := f.svc.begin(jobs, "schedule")
@@ -185,7 +211,7 @@ func TestPruneDisabledAndCheckSubset(t *testing.T) {
 	if c := strings.Join(f.be.list(), ","); c != "unlock,check 5%,stats" {
 		t.Fatalf("calls: %s", c)
 	}
-	if j := f.jobs(t)[0]; !strings.Contains(j.Message, "5%") {
+	if j := f.jobs(t)[1]; !strings.Contains(j.Message, "5%") {
 		t.Fatalf("message: %q", j.Message)
 	}
 }
@@ -404,35 +430,6 @@ func TestFailureIsRecordedGenericAndNotified(t *testing.T) {
 	}
 }
 
-func TestBackupDoneRefreshesStatsThrottled(t *testing.T) {
-	f := newFixture(t)
-	count := func() int {
-		n := 0
-		for _, c := range f.be.list() {
-			if c == "stats" {
-				n++
-			}
-		}
-		return n
-	}
-	f.svc.BackupDone()
-	f.svc.Wait()
-	f.svc.BackupDone() // within 10 minutes
-	f.svc.Wait()
-	if count() != 1 {
-		t.Fatalf("stats calls: %d", count())
-	}
-	*f.clock = f.clock.Add(11 * time.Minute)
-	f.svc.BackupDone()
-	f.svc.Wait()
-	if count() != 2 {
-		t.Fatalf("stats calls after gap: %d", count())
-	}
-	if jobs := f.jobs(t); len(jobs) != 0 {
-		t.Fatalf("refreshes are not jobs: %+v", jobs)
-	}
-}
-
 func TestStaleJobsFailedOnStart(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -460,5 +457,181 @@ func TestStatsRecordTargetSpace(t *testing.T) {
 	got, _ = f.st.LatestRepoStat(context.Background())
 	if got.TargetTotal != nil || got.TargetFree != nil {
 		t.Fatalf("unknown target must stay nil: %+v", got)
+	}
+}
+
+func (f *fixture) seedBackup(t *testing.T, server, backup string) {
+	t.Helper()
+	ctx := context.Background()
+	id, err := f.st.CreateUpload(ctx, "up-"+backup, server+"/"+backup+".tar.gz", server, backup, f.svc.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.CompleteBackup(ctx, id, store.Finish{SnapshotID: "snap-" + backup}, f.svc.now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatsJobMeasuresEachServer(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedBackup(t, "srv-a", "b1")
+	f.seedBackup(t, "srv-a", "b2")
+	f.seedBackup(t, "srv-b", "b3")
+	f.be.tagSize = map[string]int64{"server:srv-a": 111, "server:srv-b": 222}
+	if _, err := f.svc.RecordStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var tagged []string
+	for _, c := range f.be.list() {
+		if strings.HasPrefix(c, "stats server:") {
+			tagged = append(tagged, c)
+		}
+	}
+	if strings.Join(tagged, ",") != "stats server:srv-a,stats server:srv-b" {
+		t.Fatalf("calls (one per server, in order): %v", tagged)
+	}
+	got, _ := f.st.ServerStats(ctx)
+	if got["srv-a"].StoredBytes != 111 || got["srv-b"].StoredBytes != 222 || !got["srv-a"].MeasuredAt.Equal(*f.clock) {
+		t.Fatalf("stored: %+v", got)
+	}
+}
+
+func TestServerStatsFailureKeepsOldValue(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedBackup(t, "srv-a", "b1")
+	f.seedBackup(t, "srv-b", "b2")
+	f.be.tagSize = map[string]int64{"server:srv-a": 100, "server:srv-b": 200}
+	f.svc.RecordStats(ctx)
+	*f.clock = f.clock.Add(time.Hour)
+	f.be.tagErr = map[string]error{"server:srv-a": errors.New("boom")}
+	f.be.tagSize = map[string]int64{"server:srv-a": 999, "server:srv-b": 250}
+	if _, err := f.svc.RecordStats(ctx); err != nil {
+		t.Fatalf("a failing server must not fail the job: %v", err)
+	}
+	got, _ := f.st.ServerStats(ctx)
+	if got["srv-a"].StoredBytes != 100 || got["srv-a"].MeasuredAt.Equal(*f.clock) {
+		t.Fatalf("old value must stay: %+v", got["srv-a"])
+	}
+	if got["srv-b"].StoredBytes != 250 {
+		t.Fatalf("other servers continue: %+v", got["srv-b"])
+	}
+}
+
+func TestServerStatsDroppedWithoutBackups(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedBackup(t, "srv-a", "b1")
+	f.st.SetServerStat(ctx, "gone", 5, f.svc.now())
+	f.svc.RecordStats(ctx)
+	got, _ := f.st.ServerStats(ctx)
+	if _, ok := got["gone"]; ok || len(got) != 1 {
+		t.Fatalf("stale entry kept: %+v", got)
+	}
+}
+
+func (f *fakeBackend) tagCalls() []string {
+	var out []string
+	for _, c := range f.list() {
+		if strings.HasPrefix(c, "stats server:") {
+			out = append(out, strings.TrimPrefix(c, "stats "))
+		}
+	}
+	return out
+}
+
+func TestStartupMeasuresOnlyServersWithoutValue(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.seedBackup(t, "srv-a", "b1")
+	f.seedBackup(t, "srv-b", "b2")
+	f.be.tagSize = map[string]int64{"server:srv-a": 1, "server:srv-b": 2}
+	old := f.clock.Add(-24 * time.Hour)
+	f.st.SetServerStat(ctx, "srv-a", 77, old)
+	if err := f.svc.RecordStartupStats(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(f.be.tagCalls(), ","); got != "server:srv-b" {
+		t.Fatalf("calls: %s", got)
+	}
+	got, _ := f.st.ServerStats(ctx)
+	if got["srv-a"].StoredBytes != 77 || got["srv-b"].StoredBytes != 2 {
+		t.Fatalf("stats: %+v", got)
+	}
+}
+
+func TestPruneSkippedWarnsOnceAndRearms(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Cfg.PruneSkipWarn = 2
+	run := func() {
+		t.Helper()
+		if _, err := f.svc.Trigger([]string{JobPrune}); err != nil {
+			t.Fatal(err)
+		}
+		f.svc.Wait()
+	}
+	warnings := func() int {
+		n := 0
+		for _, m := range f.notif.msgs {
+			if strings.Contains(m, "uebersprungen") {
+				n++
+			}
+		}
+		return n
+	}
+	if err := f.gate.Enter(context.Background()); err != nil { // keeps the repository busy
+		t.Fatal(err)
+	}
+	run()
+	if warnings() != 0 {
+		t.Fatal("warned after a single skip")
+	}
+	if st, _ := f.svc.Status(context.Background()); st.PruneSkipped != 1 || len(st.Warnings) != 0 {
+		t.Fatalf("%+v", st)
+	}
+	run()
+	if warnings() != 1 {
+		t.Fatalf("no warning after the second skip: %v", f.notif.msgs)
+	}
+	if st, _ := f.svc.Status(context.Background()); st.PruneSkipped != 2 || len(st.Warnings) != 1 {
+		t.Fatalf("%+v", st)
+	}
+	run()
+	run()
+	if warnings() != 1 {
+		t.Fatalf("warned again while the skips continue: %d", warnings())
+	}
+	f.gate.Leave() // free again: the next prune runs and re-arms the warning
+	run()
+	if st, _ := f.svc.Status(context.Background()); st.PruneSkipped != 0 || len(st.Warnings) != 0 {
+		t.Fatalf("not cleared: %+v", st)
+	}
+	if err := f.gate.Enter(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	run()
+	run()
+	if warnings() != 2 {
+		t.Fatalf("warning not re-armed: %d", warnings())
+	}
+}
+
+func TestPruneSkipWarnDisabled(t *testing.T) {
+	f := newFixture(t) // PruneSkipWarn 0 = off
+	if err := f.gate.Enter(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := f.svc.Trigger([]string{JobPrune}); err != nil {
+			t.Fatal(err)
+		}
+		f.svc.Wait()
+	}
+	if len(f.notif.msgs) != 0 {
+		t.Fatalf("notified: %v", f.notif.msgs)
+	}
+	if st, _ := f.svc.Status(context.Background()); len(st.Warnings) != 0 || st.PruneSkipped != 3 {
+		t.Fatalf("%+v", st)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,10 @@ const (
 	StatusComplete = "complete"
 	StatusFailed   = "failed"
 	StatusDeleted  = "deleted"
+	// StatusTrashed: deleted in the panel (or its server was), still in the repository until purge_after.
+	StatusTrashed = "trashed"
+	// StatusPurging: a trashed backup whose snapshot is being forgotten right now (restore is no longer possible).
+	StatusPurging = "purging"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -54,7 +59,10 @@ CREATE TABLE IF NOT EXISTS backups (
 	started_at            INTEGER NOT NULL,
 	finished_at           INTEGER,
 	duration_ms           INTEGER NOT NULL DEFAULT 0,
-	error                 TEXT NOT NULL DEFAULT ''
+	error                 TEXT NOT NULL DEFAULT '',
+	trashed_at            INTEGER,             -- unix ms, set while status is trashed
+	purge_after           INTEGER,             -- unix ms, the nightly window forgets the snapshot after this
+	trash_reason          TEXT NOT NULL DEFAULT ''  -- panel_delete, server_deleted
 );
 CREATE INDEX IF NOT EXISTS backups_key ON backups(key);
 CREATE TABLE IF NOT EXISTS files (
@@ -63,14 +71,16 @@ CREATE TABLE IF NOT EXISTS files (
 	type      TEXT NOT NULL,
 	size      INTEGER NOT NULL,
 	mode      INTEGER NOT NULL,
-	mtime     INTEGER NOT NULL
+	mtime     INTEGER NOT NULL,
+	sha256    BLOB
 );
 DROP INDEX IF EXISTS files_backup;
 CREATE INDEX IF NOT EXISTS files_backup_path ON files(backup_id, path);
+CREATE INDEX IF NOT EXISTS files_backup_type_path ON files(backup_id, type, path);
 CREATE INDEX IF NOT EXISTS backups_uuid ON backups(backup_uuid);
 CREATE TABLE IF NOT EXISTS maintenance_jobs (
 	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	type        TEXT NOT NULL,           -- prune, check, stats
+	type        TEXT NOT NULL,           -- prune, check, stats, trash-purge, copy, forget-secondary, prune-secondary, check-secondary
 	trigger     TEXT NOT NULL,           -- schedule, manual
 	started_at  INTEGER NOT NULL,
 	finished_at INTEGER,
@@ -90,6 +100,37 @@ CREATE TABLE IF NOT EXISTS repo_stats (
 	target_free_bytes       INTEGER          -- available space on the target (statfs), NULL if unknown
 );
 CREATE INDEX IF NOT EXISTS repo_stats_ts ON repo_stats(ts);
+CREATE TABLE IF NOT EXISTS offsite_state (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS offsite_copies (
+	snapshot_id   TEXT PRIMARY KEY,      -- snapshot ID on the secondary
+	original_id   TEXT NOT NULL,         -- snapshot ID in the primary it was copied from
+	copied_at     INTEGER NOT NULL,      -- unix ms
+	missing_since INTEGER,               -- unix ms, since when the original is gone from the primary (NULL = present)
+	forgotten_at  INTEGER                -- unix ms, NULL = still on the secondary
+);
+CREATE TABLE IF NOT EXISTS settings (
+	key        TEXT PRIMARY KEY,
+	value      TEXT NOT NULL,            -- JSON
+	updated_at INTEGER NOT NULL          -- unix ms
+);
+CREATE TABLE IF NOT EXISTS emergency_keys (
+	key_id     TEXT PRIMARY KEY,         -- restic key ID (never the password)
+	label      TEXT NOT NULL,
+	created_at INTEGER NOT NULL          -- unix ms
+);
+CREATE TABLE IF NOT EXISTS deleted_servers (
+	server_uuid TEXT PRIMARY KEY,
+	deleted_at  INTEGER NOT NULL,        -- unix ms, when the gateway learned that the panel deleted the server
+	purge_after INTEGER NOT NULL         -- unix ms, deleted_at + orphan retention
+);
+CREATE TABLE IF NOT EXISTS server_stats (
+	server_uuid TEXT PRIMARY KEY,
+	stored_bytes INTEGER NOT NULL,       -- restic raw-data size of this server's snapshots
+	measured_at  INTEGER NOT NULL        -- unix ms
+);
 `
 
 type Store struct{ db *sql.DB }
@@ -139,7 +180,56 @@ func migrate(db *sql.DB) error {
 			}
 		}
 	}
+	// files.sha256: additive, old rows keep NULL, older gateways ignore the column.
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('files') WHERE name='sha256'`).Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		// A second gateway process may have added the column in the meantime.
+		if _, err := db.Exec(`ALTER TABLE files ADD COLUMN sha256 BLOB`); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	return migrateBackups(db)
+}
+
+// migrateBackups adds the trash columns to databases created before the trash existed.
+func migrateBackups(db *sql.DB) error {
+	have := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM pragma_table_info('backups')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return err
+		}
+		have[n] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, c := range [][2]string{
+		{"trashed_at", "INTEGER"}, {"purge_after", "INTEGER"}, {"trash_reason", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if !have[c[0]] {
+			if _, err := db.Exec(`ALTER TABLE backups ADD COLUMN ` + c[0] + ` ` + c[1]); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+// nullable maps an empty hash to SQL NULL.
+func nullable(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -170,6 +260,9 @@ type FileEntry struct {
 	Size  int64
 	Mode  int64
 	MTime time.Time
+	// SHA256 is the content hash of a regular file (32 bytes); nil for other
+	// entries, entries of older backups and when hashing is switched off.
+	SHA256 []byte
 }
 
 // CreateUpload records a new upload together with its pending backup row.
@@ -281,13 +374,13 @@ func (s *Store) insertBatch(ctx context.Context, backupID int64, files []FileEnt
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO files (backup_id, path, type, size, mode, mtime) VALUES (?,?,?,?,?,?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO files (backup_id, path, type, size, mode, mtime, sha256) VALUES (?,?,?,?,?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, e := range files {
-		if _, err := stmt.ExecContext(ctx, backupID, e.Path, e.Type, e.Size, e.Mode, e.MTime.Unix()); err != nil {
+		if _, err := stmt.ExecContext(ctx, backupID, e.Path, e.Type, e.Size, e.Mode, e.MTime.Unix(), nullable(e.SHA256)); err != nil {
 			return err
 		}
 	}
@@ -314,10 +407,11 @@ func (s *Store) MarkDeleted(ctx context.Context, backupID int64) error {
 const backupCols = `id, key, server_uuid, backup_uuid, upload_id, snapshot_id, status, compressed_bytes, uncompressed_bytes,
 	data_added, total_bytes_processed, file_count, index_truncated, started_at, finished_at, duration_ms, error`
 
-// BackupByKey returns the newest backup for key that is not deleted.
+// BackupByKey returns the newest backup for key that is neither deleted nor
+// in the trash (the panel no longer knows trashed backups).
 func (s *Store) BackupByKey(ctx context.Context, key string) (*Backup, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+backupCols+` FROM backups WHERE key=? AND status<>? ORDER BY id DESC LIMIT 1`,
-		key, StatusDeleted)
+	row := s.db.QueryRowContext(ctx, `SELECT `+backupCols+` FROM backups WHERE key=? AND status NOT IN (?,?,?) ORDER BY id DESC LIMIT 1`,
+		key, StatusDeleted, StatusTrashed, StatusPurging)
 	return scanBackup(row)
 }
 
@@ -351,7 +445,7 @@ func scanBackup(row interface{ Scan(...any) error }) (*Backup, error) {
 
 // Files returns the indexed entries of a backup ordered by path.
 func (s *Store) Files(ctx context.Context, backupID int64) ([]FileEntry, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT path, type, size, mode, mtime FROM files WHERE backup_id=? ORDER BY path`, backupID)
+	rows, err := s.db.QueryContext(ctx, `SELECT path, type, size, mode, mtime, sha256 FROM files WHERE backup_id=? ORDER BY path`, backupID)
 	if err != nil {
 		return nil, err
 	}
@@ -360,11 +454,35 @@ func (s *Store) Files(ctx context.Context, backupID int64) ([]FileEntry, error) 
 	for rows.Next() {
 		var e FileEntry
 		var mt int64
-		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &e.Mode, &mt); err != nil {
+		if err := rows.Scan(&e.Path, &e.Type, &e.Size, &e.Mode, &mt, &e.SHA256); err != nil {
 			return nil, err
 		}
 		e.MTime = time.Unix(mt, 0)
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// PendingBackup identifies a backup whose upload has not finished.
+type PendingBackup struct {
+	ID                     int64
+	ServerUUID, BackupUUID string
+}
+
+// PendingBackups lists backups that are still pending (call before FailStale to learn which ones it will fail).
+func (s *Store) PendingBackups(ctx context.Context) ([]PendingBackup, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, server_uuid, backup_uuid FROM backups WHERE status=? ORDER BY id`, StatusPending)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingBackup
+	for rows.Next() {
+		var p PendingBackup
+		if err := rows.Scan(&p.ID, &p.ServerUUID, &p.BackupUUID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
@@ -379,5 +497,13 @@ func (s *Store) FailStale(ctx context.Context, now time.Time) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return n, err
+	}
+	// A purge that was interrupted by a stop is tried again (forget of a gone snapshot counts as success).
+	if _, err := s.db.ExecContext(ctx, `UPDATE backups SET status=? WHERE status=?`, StatusTrashed, StatusPurging); err != nil {
+		return n, err
+	}
+	return n, nil
 }

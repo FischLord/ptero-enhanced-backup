@@ -3,6 +3,7 @@ package admin
 import (
 	"archive/tar"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"mime"
@@ -79,6 +80,8 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request) {
 		Size  int64   `json:"size"`
 		Mode  *string `json:"mode"`
 		MTime *string `json:"mtime"`
+		// SHA256 is the hex content hash of a file, null if unknown.
+		SHA256 *string `json:"sha256"`
 	}
 	items := make([]item, 0, len(entries))
 	for _, e := range entries {
@@ -89,7 +92,12 @@ func (s *Server) files(w http.ResponseWriter, r *http.Request) {
 			m := "0" + strconv.FormatInt(e.Mode&0o7777, 8)
 			mode = &m
 		}
-		items = append(items, item{Name: e.Name, Path: path.Join(dir, e.Name), Type: kind(e), Size: e.Size, Mode: mode, MTime: mt})
+		var sum *string
+		if len(e.SHA256) > 0 && e.Type == "f" {
+			h := hex.EncodeToString(e.SHA256)
+			sum = &h
+		}
+		items = append(items, item{Name: e.Name, Path: path.Join(dir, e.Name), Type: kind(e), Size: e.Size, Mode: mode, MTime: mt, SHA256: sum})
 	}
 	writeJSON(w, 200, map[string]any{
 		"backup_uuid": b.BackupUUID, "path": dir, "index_truncated": b.IndexTruncated,

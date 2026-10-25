@@ -10,9 +10,12 @@ export interface PanelServerRef {
     backup_count: number;
 }
 
+/** Jobs der Offsite-Kopie; sie erscheinen in der Wartungsliste, lassen sich dort aber nicht anstossen. */
+export type OffsiteJobName = 'copy' | 'forget-secondary' | 'prune-secondary' | 'check-secondary';
+
 export interface MaintenanceJob {
     id: number;
-    type: 'prune' | 'check' | 'stats';
+    type: 'prune' | 'check' | 'stats' | 'trash-purge' | OffsiteJobName;
     trigger: 'schedule' | 'manual';
     started_at: string | null;
     finished_at: string | null;
@@ -34,6 +37,10 @@ export interface GatewayStatus {
         last_prune: MaintenanceJob | null;
         last_check: MaintenanceJob | null;
         running_job: MaintenanceJob | null;
+        /** Prune-Laeufe in Folge, die als "skipped: busy" uebersprungen wurden (Gateway ab 0.2.0). */
+        prune_skipped_consecutive?: number;
+        /** Kurze Warntexte des Gateways (englisch), leer = keine. */
+        warnings?: string[];
     };
 }
 
@@ -54,6 +61,29 @@ export interface GatewaySummary {
     failures_30d: number;
     last_backup_at: string | null;
     target: StorageTarget | null;
+    /** Fehlt bei Gateways vor 0.2.0. */
+    secondary?: SecondaryStatus;
+    /** Papierkorb (Gateway ab 0.2.0); `logical_bytes` = Originalgroesse der enthaltenen Backups. */
+    trash?: { count: number; logical_bytes: number; next_purge_at: string | null };
+}
+
+/** Offsite-Kopie (Zweitziel); `repo` ist ohne Zugangsdaten. */
+export interface SecondaryStatus {
+    configured: boolean;
+    repo: string | null;
+    type: string | null;
+    state: 'off' | 'ok' | 'copying' | 'pending' | 'error';
+    running: boolean;
+    last_copy_at: string | null;
+    last_copy_result: 'ok' | 'failed' | null;
+    last_error: string;
+    /** Der naechtliche Forget-Schritt ist durch eine Sicherung gestoppt, bis er freigegeben wird. */
+    forget_blocked?: boolean;
+    lag_snapshots: number | null;
+    lag_since: string | null;
+    stored_bytes: number | null;
+    stored_at: string | null;
+    next_copy_at: string | null;
 }
 
 /** Platz auf dem Backup-Ziel; `exact` false = Schaetzung aus PEB_REPO_CAPACITY_BYTES. */
@@ -127,6 +157,9 @@ export interface ServerRow {
     last_duration_ms: number;
     last_backup_bytes: number;
     last_data_added: number;
+    /** Space of this server's snapshots on the target (compressed, deduplicated); null until measured or on older gateways. */
+    stored_bytes?: number | null;
+    stored_at?: string | null;
     health: ServerHealth;
 }
 
@@ -179,6 +212,8 @@ export interface FilesResponse extends Paged<FileEntry> {
 }
 
 export type MaintenanceJobName = 'prune' | 'check' | 'stats';
+/** Was `POST maintenance/run` annimmt: die Wartungsjobs und die Offsite-Kopie. */
+export type RunJobName = MaintenanceJobName | 'copy';
 
 export interface ApiErrorInfo {
     code: string;
@@ -189,4 +224,127 @@ export interface ApiErrorInfo {
 /** Antwort von GET /edition: ob die Pro-Extension aktiv ist (siehe PHP: Pro\ProRegistry). */
 export interface Edition {
     pro: { installed: boolean; id: string | null; version: string | null; features: string[] };
+}
+
+export type CheckStatus = 'ok' | 'warn' | 'fail';
+
+export interface SetupCheck {
+    id: string;
+    status: CheckStatus;
+    hint: string | null;
+    value?: number | null;
+}
+
+export interface SetupState {
+    available: { egg_import: boolean; egg_update: boolean; server_create: boolean; s3_probe: boolean };
+    ready: boolean;
+    checks: SetupCheck[];
+    egg: { name: string | null; exists: boolean; id: number | null; error: string | null };
+    defaults: { name: string; bucket: string; region: string; repository: string; memory: number; disk: number };
+    snippets: { env: string; wings: string };
+}
+
+export interface SetupNode {
+    id: number;
+    name: string;
+    fqdn: string;
+    free_allocations: number;
+}
+
+export interface SetupAllocation {
+    id: number;
+    ip: string;
+    alias: string | null;
+    port: number;
+}
+
+export interface SetupUser {
+    id: number;
+    username: string;
+    email: string;
+}
+
+export interface GatewayServerForm {
+    name: string;
+    owner_id: number;
+    allocation_id: number;
+    memory: number;
+    disk: number;
+    bucket: string;
+    region: string;
+    repository: string;
+    host: string;
+}
+
+/** Antwort von POST /setup/server. Enthaelt die Geheimnisse; nur im Speicher halten, nie cachen oder ablegen. */
+export interface CreatedGatewayServer {
+    server: { id: number; uuid: string; name: string };
+    gateway_url: string;
+    credentials: { access_key: string; secret_key: string; admin_token: string; restic_password: string; bucket: string; region: string };
+    snippets: { env: string; wings: string };
+}
+
+export interface SelfTestResult {
+    ok: boolean;
+    checks: SetupCheck[];
+}
+
+/** Gateway-weite Bestaetigung, dass das Restic-Passwort an einem zweiten Ort liegt (Gateway ab 0.2.0). */
+export interface PasswordAck {
+    acknowledged: boolean;
+    acknowledged_at: string | null;
+    by: string;
+}
+
+/** Ein restic-Schluessel des Repositorys. `emergency` = ueber die Extension erzeugt. */
+export interface RepoKey {
+    id: string;
+    short_id: string;
+    created_at: string | null;
+    host: string;
+    user: string;
+    current: boolean;
+    emergency: boolean;
+    label: string;
+}
+
+/** Antwort von POST /keys. `password` kommt genau einmal vor; nur im Speicher halten, nie cachen oder ablegen. */
+export interface CreatedKey {
+    id: string;
+    short_id: string;
+    label: string;
+    host: string;
+    user: string;
+    created_at: string | null;
+    password: string;
+}
+
+/** Daten fuer das Notfallblatt (ohne Passwort). */
+export interface EmergencySheetData {
+    gateway_url: string;
+    repo: { type: string; location: string };
+    secondary: { type: string; repo: string } | null;
+    servers: { uuid: string; name: string | null }[];
+    generated_at: string;
+}
+
+/** Warum ein Backup im Papierkorb liegt. */
+export type TrashReason = 'panel_delete' | 'server_deleted';
+
+export interface TrashRow {
+    backup_uuid: string;
+    server_uuid: string;
+    server: PanelServerRef | null;
+    reason: TrashReason;
+    logical_bytes: number;
+    received_bytes: number;
+    finished_at: string | null;
+    trashed_at: string | null;
+    purge_after: string | null;
+}
+
+export interface TrashResponse {
+    total: number;
+    logical_bytes: number;
+    items: TrashRow[];
 }
